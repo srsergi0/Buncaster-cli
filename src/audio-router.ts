@@ -5,6 +5,7 @@ import { state } from "./state";
 import { broadcast, broadcastOpus } from "./broadcaster";
 import { bitrateDetector } from "./bitrate-detector";
 import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
+import { NativeDecoder, isNativeDecodeAvailable } from "./decode-ffi";
 import { FORMAT_CONFIG } from "./format-config";
 
 export let opusHeaders: Uint8Array | null = null;
@@ -12,13 +13,32 @@ export let opusHeaders: Uint8Array | null = null;
 // =============================================================
 // 1. CLASE BUFFER FIFO DE AUDIO PCM
 // =============================================================
+// Diseño "cero allocaciones": un deck secundario solo necesita la
+// ventana de crossfade de audio bufferizada (el resto de la canción se
+// descarta al llenarse el FIFO). Antes se bufferizaba la canción
+// completa (~46MB por tema a 192KB/s) y esa memoria quedaba retenida
+// hasta que el deck moría. pullInto() escribe en un buffer del pool PCM
+// (reutilizable) en vez de alocar uno nuevo por chunk.
+// 192KB/s = 48000Hz × 2ch × 2bytes.
+const DECK_BUFFER_CAP_BYTES = (config.crossfadeSeconds + 1) * 192_000;
 class AudioStreamBuffer {
   private queue: Uint8Array[] = [];
   private totalBytes = 0;
+  private readonly maxBytes: number;
+
+  constructor(maxBytes = 0) {
+    this.maxBytes = maxBytes;
+  }
 
   push(chunk: Uint8Array) {
     this.queue.push(chunk);
     this.totalBytes += chunk.byteLength;
+    if (this.maxBytes > 0) {
+      while (this.totalBytes > this.maxBytes && this.queue.length > 1) {
+        const removed = this.queue.shift()!;
+        this.totalBytes -= removed.byteLength;
+      }
+    }
   }
 
   pull(bytesNeeded: number): Uint8Array {

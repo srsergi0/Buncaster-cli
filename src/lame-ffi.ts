@@ -1,10 +1,8 @@
 import { dlopen, ptr } from "bun:ffi";
 import { rtmpLog } from "./logger";
 
-// =============================================================
-// Wrapper Bun.FFI sobre libmp3lame.so — encoding MP3 sin ffmpeg
-// =============================================================
-// Llama directamente a la librería C compartida del sistema,
+// ======================================================// Wrapper Bun.FFI sobre libmp3lame.so — encoding MP3 sin ffmpeg
+// ======================================================// Llama directamente a la librería C compartida del sistema,
 // sin spawn de procesos, sin pipes stdin/stdout. Esto elimina
 // el proceso master ffmpeg (~100MB RSS, ~45% CPU con loudnorm).
 //
@@ -83,10 +81,22 @@ export function isNativeLameAvailable(): boolean {
   return false;
 }
 
+// Anillo de buffers MP3 pre-asignados (diseño "cero allocaciones"):
+// la steady-state de un stream 24/7 no debe alocar memoria por chunk.
+// encode() escribe en el siguiente slot del anillo y devuelve una vista
+// (sin copia). Con los decks emitiendo ~1 chunk/s (asetnsamples), el slot
+// se reutiliza tras MP3_SLOT_COUNT encodes (~128s), y la política de
+// expulsión de oyentes lentos (highWaterMark 256KB + 5 strikes ≈ ~7s de
+// lag máximo) garantiza que ningún oyente lea un slot ya sobrescrito.
+// preBuffer (64KB) solo retiene vistas recientes, siempre válidas.
+const MP3_SLOT_SIZE = 72 * 1024;
+const MP3_SLOT_COUNT = 128;
+const EMPTY_MP3 = new Uint8Array(0);
+
 export class LameEncoder {
   private lame = 0;
-  private mp3buf: Uint8Array;
-  private mp3bufSize: number;
+  private slots: Uint8Array[] = [];
+  private slotIdx = 0;
   private closed = false;
 
   constructor(
@@ -121,64 +131,70 @@ export class LameEncoder {
       throw new Error(`lame_init_params() failed (code ${ret})`);
     }
 
-    // Buffer de salida MP3 pre-asignado y reutilizable.
-    // LAME recomienda: 1.25 * numSamples + 7200 bytes.
-    // Para chunks de hasta 192KB PCM (48K frames) → ~67KB + 7200 = ~74KB.
-    // Usamos 256KB para margen absoluto.
-    this.mp3bufSize = 256 * 1024;
-    this.mp3buf = new Uint8Array(this.mp3bufSize);
+    // Anillo de slots pre-asignado: ~128 × 72KB ≈ 9MB.
+    // Un slot solo se crece (caso raro: chunk PCM gigante) y nunca se
+    // libera, evitando cualquier churn en el hot path.
+    for (let i = 0; i < MP3_SLOT_COUNT; i++) {
+      this.slots[i] = new Uint8Array(MP3_SLOT_SIZE);
+    }
+  }
+
+  private nextSlot(needed: number): Uint8Array {
+    const idx = this.slotIdx;
+    this.slotIdx = (this.slotIdx + 1) % MP3_SLOT_COUNT;
+    const slot = this.slots[idx]!;
+    if (slot.byteLength >= needed) return slot;
+    const grown = new Uint8Array(Math.max(needed, slot.byteLength * 2));
+    this.slots[idx] = grown;
+    return grown;
   }
 
   /**
    * Encodea PCM interleaved stereo (Int16Array) a MP3.
-   * Devuelve un Uint8Array nuevo (copia) seguro para broadcast.
+   * Devuelve una vista de un slot del anillo (sin copia). El slot es
+   * seguro de usar por los oyentes hasta que el anillo dé la vuelta
+   * (MP3_SLOT_COUNT encodes después).
    */
   encode(pcm: Int16Array): Uint8Array {
-    if (this.closed || !this.lame || !symbols) return new Uint8Array(0);
+    if (this.closed || !this.lame || !symbols) return EMPTY_MP3;
 
     const numSamples = pcm.length / 2; // frames (stereo interleaved)
-    if (numSamples === 0) return new Uint8Array(0);
+    if (numSamples === 0) return EMPTY_MP3;
 
-    // Crecer buffer si es necesario (caso raro: chunk enorme)
     const needed = Math.floor(1.25 * numSamples + 7200);
-    if (needed > this.mp3bufSize) {
-      this.mp3bufSize = needed;
-      this.mp3buf = new Uint8Array(this.mp3bufSize);
-    }
+    const slot = this.nextSlot(needed);
 
     const written = symbols.lame_encode_buffer_interleaved(
       this.lame,
       ptr(pcm),
       numSamples,
-      ptr(this.mp3buf),
-      this.mp3bufSize,
+      ptr(slot),
+      slot.byteLength,
     );
 
     if (written < 0) {
       rtmpLog.error(`[LAME-FFI] encoding error: ${written}`);
-      return new Uint8Array(0);
+      return EMPTY_MP3;
     }
 
-    // Copia: broadcast() encola el mismo Uint8Array en múltiples listeners.
-    // Si reutilizáramos el buffer en el siguiente encode(), se corrompería.
-    // La copia es pequeña (~4-16KB de MP3 por chunk).
-    return this.mp3buf.slice(0, written);
+    return slot.subarray(0, written);
   }
 
   /**
    * Flush final: devuelve los últimos frames MP3 pendientes.
    */
   flush(): Uint8Array {
-    if (this.closed || !this.lame || !symbols) return new Uint8Array(0);
+    if (this.closed || !this.lame || !symbols) return EMPTY_MP3;
 
+    const slot = this.nextSlot(MP3_SLOT_SIZE);
     const written = symbols.lame_encode_flush(
       this.lame,
-      ptr(this.mp3buf),
-      this.mp3bufSize,
+      ptr(slot),
+      slot.byteLength,
     );
 
-    if (written < 0) return new Uint8Array(0);
-    return this.mp3buf.slice(0, written);
+    if (written < 0) return EMPTY_MP3;
+    return slot.subarray(0, written);
   }
 
   close() {

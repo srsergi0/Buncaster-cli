@@ -2,6 +2,9 @@ import { config } from "./config";
 import { state } from "./state";
 import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
+
+// Rutas que sirven el stream de audio (alias de estación)
+const STREAM_PATHS = new Set(["/stream", "/", "/radiobloom.mp3", "/radio.mp3", "/stream.mp3", "/opus", "/stream/opus"]);
 import {
   corsHeaders,
   checkStreamKey,
@@ -60,8 +63,9 @@ export const httpServer = Bun.serve({
       });
     }
 
-    // ---- Stream de audio (dual-tier mp3 + opus) ----
-    if ((path === "/stream" || path === "/" || path === "/opus" || path === "/stream/opus") && (req.method === "GET" || req.method === "HEAD")) {
+    // ---- Stream de audio ----
+    // Rutas: /stream, /, /radiobloom.mp3, /radio.mp3, /stream.mp3 + opus tier
+    if ((STREAM_PATHS.has(path) || path === "/opus" || path === "/stream/opus") && (req.method === "GET" || req.method === "HEAD")) {
       if (state.clients.size >= config.maxListeners) {
         return new Response("Server at max listeners", { status: 503, headers: corsHeaders() });
       }
@@ -81,7 +85,9 @@ export const httpServer = Bun.serve({
 
       const streamHeaders: Record<string, string> = {
         "Content-Type": isOpus ? FORMAT_CONFIG["opus"].mime : FORMAT_CONFIG[config.streamFormat].mime,
-        "Cache-Control": "no-cache, no-store",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Content-Encoding": "identity",
+        "X-Accel-Buffering": "no",
         Connection: "keep-alive",
         ...corsHeaders(),
       };
@@ -158,7 +164,7 @@ export const httpServer = Bun.serve({
             httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`);
           },
         },
-        { highWaterMark: config.lowLatency ? 16 * 1024 : 256 * 1024 }
+        { highWaterMark: config.lowLatency ? 16 * 1024 : config.preBufferBytes + 256 * 1024 }
       );
 
       req.signal.addEventListener("abort", () => {
