@@ -4,7 +4,8 @@ WORKDIR /app
 COPY package.json bun.lock tsconfig.json ./
 RUN bun install --production --frozen-lockfile
 COPY src ./src
-RUN bun build --compile --target=bun-linux-x64-modern --outfile=buncaster src/index-rtmp.ts
+# Private fork CLI: bundler Bun via Inquirer.js entry
+RUN bun build --compile --target=bun-linux-x64-modern --outfile=buncaster src/cli.ts
 
 # Stage 2: imagen mínima de runtime (solo ffmpeg + binario)
 FROM alpine:3.20

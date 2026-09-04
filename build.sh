@@ -37,10 +37,10 @@ build_binary() {
             -v "$(pwd):/app" \
             -w /app \
             oven/bun:alpine \
-            sh -c "bun install --frozen-lockfile && bun build --compile --target=${target} --outfile=dist/${output} src/index-rtmp.ts"
+            sh -c "bun install --frozen-lockfile && bun build --compile --target=${target} --outfile=dist/${output} src/cli.ts"
     else
-        # Cross-compile desde Bun local
-        bun build --compile --target="${target}" --outfile="dist/${output}" src/index-rtmp.ts
+        # Cross-compile desde Bun local (bundler CLI via Inquirer.js)
+        bun build --compile --target="${target}" --outfile="dist/${output}" src/cli.ts
     fi
     
     echo "    ✓ dist/${output}"

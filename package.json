@@ -1,12 +1,21 @@
 {
   "name": "bunradio",
+  "version": "1.0.0",
   "module": "src/index-rtmp.ts",
   "type": "module",
   "private": true,
+  "bin": {
+    "bunradio": "src/cli.ts"
+  },
   "scripts": {
-    "dev": "bun run --watch src/index-rtmp.ts",
-    "start": "bun run src/index-rtmp.ts",
-    "build": "bun build --compile --outfile=bunradio src/index-rtmp.ts",
+    "dev": "bun run --watch src/cli.ts -- --yes",
+    "dev:server": "bun run --watch src/index-rtmp.ts",
+    "start": "bun run src/cli.ts -- --yes",
+    "start:server": "bun run src/index-rtmp.ts",
+    "cli": "bun run src/cli.ts",
+    "build": "bun build --compile --outfile=bunradio src/cli.ts",
+    "build:server": "bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
+    "build:all": "bun build --compile --outfile=bunradio src/cli.ts && bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
     "mcp": "bun run src/mcp-server.ts"
   },
   "devDependencies": {
@@ -16,6 +25,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "inquirer": "^14.2.1",
     "mcp-lite": "^0.10.0",
     "zod": "^4.4.3"
   }
