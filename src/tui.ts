@@ -141,9 +141,9 @@ export async function startTui(): Promise<void> {
     style: { fg: "white", bg: NEON.bg, border: { fg: NEON.cyan } },
   });
 
-  // Now Playing — left 32%
+  // Now Playing — left 32% (42% height to leave room for action box below queue)
   const nowBox = blessed.box({
-    top: 5, left: 0, width: "32%", height: "48%",
+    top: 5, left: 0, width: "32%", height: "42%",
     label: "  ♫  NOW PLAYING  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.cyan }, label: { fg: NEON.cyan, bold: true } },
     padding: { left: 1, right: 1 },
@@ -158,17 +158,17 @@ export async function startTui(): Promise<void> {
     border: { type: "line" },
   });
 
-  // Streams — center 36%
+  // Streams — center 36% (42% to align with queue)
   const streamBox = blessed.box({
-    top: 5, left: "32%", width: "36%", height: "48%",
+    top: 5, left: "32%", width: "36%", height: "42%",
     label: "  ◉  STREAMS  — click to open  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.magenta }, label: { fg: NEON.magenta, bold: true } },
     padding: { left: 1, right: 1 },
   });
 
-  // Queue — right 32%
+  // Queue — right 32% (leave room for action box below)
   const queueBox = blessed.list({
-    top: 5, left: "68%", width: "32%", height: "48%",
+    top: 5, left: "68%", width: "32%", height: "42%",
     label: "  ≡  QUEUE  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.yellow }, label: { fg: NEON.yellow, bold: true }, selected: { bg: NEON.yellow, fg: "#1a1200", bold: true }, item: { fg: NEON.grey } },
     keys: true, mouse: true, vi: true,
@@ -208,22 +208,22 @@ export async function startTui(): Promise<void> {
   });
 
   // Health now as colored circle in header/side, not a button
-  // Music controls below Queue — Add Song / Add Folder (requested, below queue)
+  // Music controls below Queue — Add Song / Add Folder (below queue, not covering logs)
   const queueActionBox = blessed.box({
-    top: "50%", left: "68%", width: "32%", height: 3,
+    top: "47%", left: "68%", width: "32%", height: "6%",
     tags: true,
     style: { bg: NEON.panelBg },
   });
   const btnAddSong = blessed.button({
     parent: queueActionBox, mouse: true, keys: true, shrink: false,
-    top: 0, left: "2%", width: "46%", height: 3,
+    top: 0, left: "2%", width: "46%", height: 1,
     content: "+ Song", align: "center",
     padding: { left: 1, right: 1 }, border: { type: "line" },
     style: { bg: "#1e2a1e", fg: NEON.green, focus: { bg: NEON.green, fg: "#001210" }, hover: { bg: NEON.green, fg: "#001210" } },
   });
   const btnAddFolder = blessed.button({
     parent: queueActionBox, mouse: true, keys: true, shrink: false,
-    top: 0, left: "52%", width: "46%", height: 3,
+    top: 0, left: "52%", width: "46%", height: 1,
     content: "+ Folder", align: "center",
     padding: { left: 1, right: 1 }, border: { type: "line" },
     style: { bg: "#1e1e2a", fg: NEON.cyan, focus: { bg: NEON.cyan, fg: "#001210" }, hover: { bg: NEON.cyan, fg: "#001210" } },
@@ -244,20 +244,18 @@ export async function startTui(): Promise<void> {
     const narrow = w < 100;
     const tiny = w < 70;
     if (narrow) {
-      // Stack vertically — no more cut-off, buttons stay % based
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "20%";
-      (streamBox as any).top = "25%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "22%";
-      (queueBox as any).top = "47%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "14%";
-      (queueActionBox as any).top = "61%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = 3; (queueActionBox as any).show();
-      (logBox as any).top = "64%"; (logBox as any).height = "30%";
-      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); (logBox as any).top = "47%"; (logBox as any).height = "46%"; }
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "18%";
+      (streamBox as any).top = "23%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "20%";
+      (queueBox as any).top = "43%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "12%";
+      (queueActionBox as any).top = "55%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
+      (logBox as any).top = "61%"; (logBox as any).height = "32%";
+      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); (logBox as any).top = "43%"; (logBox as any).height = "50%"; }
       else { (queueBox as any).show(); (queueActionBox as any).show(); }
     } else {
-      // Wide — 3 columns
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "45%";
-      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "45%";
-      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "45%";
-      (queueActionBox as any).top = "50%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = 3; (queueActionBox as any).show();
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "42%";
+      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "42%";
+      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "42%";
+      (queueActionBox as any).top = "47%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
       (queueBox as any).show();
       (logBox as any).top = "53%"; (logBox as any).height = "40%";
     }
