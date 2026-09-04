@@ -21,22 +21,22 @@ function makeLogger(scope: string) {
   return {
     debug: (...args: unknown[]) => {
       if (!enabled("debug")) return;
-      console.debug(`[${ts()}] DEBUG [${scope}]`, ...args);
+      console.debug(`DEBUG [${scope}]`, ...args);
       appendFileLog(scope, "DEBUG", args);
     },
     info: (...args: unknown[]) => {
       if (!enabled("info")) return;
-      console.log(`[${ts()}] INFO  [${scope}]`, ...args);
+      console.log(`INFO  [${scope}]`, ...args);
       appendFileLog(scope, "INFO", args);
     },
     warn: (...args: unknown[]) => {
       if (!enabled("warn")) return;
-      console.warn(`[${ts()}] WARN  [${scope}]`, ...args);
+      console.warn(`WARN  [${scope}]`, ...args);
       appendFileLog(scope, "WARN", args);
     },
     error: (...args: unknown[]) => {
       if (!enabled("error")) return;
-      console.error(`[${ts()}] ERROR [${scope}]`, ...args);
+      console.error(`ERROR [${scope}]`, ...args);
       appendFileLog(scope, "ERROR", args);
     },
   };
