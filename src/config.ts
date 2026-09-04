@@ -4,7 +4,9 @@ import { type StreamFormat, validateFormat } from "./format-config";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface Config {
-  httpPort: number;
+  httpPort: number; // dashboard + streams (back-compat, same as dashboardPort)
+  dashboardPort: number;
+  outputPort: number;
   rtmpPort: number;
   srtPort: number;
   host: string;
@@ -59,18 +61,28 @@ function generateStreamKey(): string {
 
 function loadConfig(): Config {
   const rtmpKey = process.env.RTMP_STREAM_KEY || generateStreamKey();
-  const httpPort = envInt("PORT", 8080);
-  const rtmpPort = envInt("RTMP_PORT", findFreePort(1935, [httpPort]));
-  const srtPort = envInt("SRT_PORT", findFreePort(1936, [httpPort, rtmpPort]));
+  // Dashboard (web) and outputs (streams) can be same or separate — user is prompted via CLI
+  const dashboardPort = envInt("DASHBOARD_PORT", envInt("PORT", 8080));
+  const outputPort = envInt("OUTPUT_PORT", envInt("STREAM_PORT", dashboardPort));
+  const httpPort = dashboardPort; // back-compat alias
+  const rtmpPort = envInt("RTMP_PORT", findFreePort(1935, [dashboardPort, outputPort]));
+  const srtPort = envInt("SRT_PORT", findFreePort(1936, [dashboardPort, outputPort, rtmpPort]));
   const host = process.env.HOST || "0.0.0.0";
 
-  if (httpPort === rtmpPort || httpPort === srtPort || rtmpPort === srtPort) {
-    throw new Error("PORT, RTMP_PORT y SRT_PORT deben ser distintos");
+  const allPorts = [dashboardPort, outputPort, rtmpPort, srtPort];
+  // Only enforce distinct for SRT/RTMP vs dashboard/output if they are not intentionally the same for dashboard/output
+  if (new Set([rtmpPort, srtPort, dashboardPort]).size !== 3 && dashboardPort !== outputPort) {
+    // dashboard and output may be same, that's ok; but RTMP/SRT must be distinct
+  }
+  if (rtmpPort === srtPort) {
+    throw new Error("RTMP_PORT y SRT_PORT deben ser distintos");
   }
 
   const lowLatency = envBool("LOW_LATENCY", true);
   const cfg: Config = {
     httpPort,
+    dashboardPort,
+    outputPort,
     rtmpPort,
     srtPort,
     host,

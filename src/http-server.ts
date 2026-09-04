@@ -237,5 +237,6 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   return Response.json({ error: "Not Found" }, { status: 404, headers: corsHeaders() });
 };
 
-export const httpServer = tryServe(config.httpPort);
+export const httpServer = tryServe(config.dashboardPort);
+export const outputServer = config.outputPort !== config.dashboardPort ? tryServe(config.outputPort) : httpServer;
 
