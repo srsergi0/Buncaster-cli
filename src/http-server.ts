@@ -4,7 +4,8 @@ import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
 
 // Rutas que sirven el stream de audio (alias de estación)
-const STREAM_PATHS = new Set(["/stream", "/", "/radiobloom.mp3", "/radio.mp3", "/stream.mp3", "/opus", "/stream/opus"]);
+// Literal: /mp3 (320k) y /opus (96k) — ultra simple para usuario común
+const STREAM_PATHS = new Set(["/stream", "/", "/mp3", "/opus", "/radiobloom.mp3", "/radio.mp3", "/stream.mp3", "/stream/opus"]);
 import {
   corsHeaders,
   checkStreamKey,
@@ -64,8 +65,8 @@ export const httpServer = Bun.serve({
     }
 
     // ---- Stream de audio ----
-    // Rutas: /stream, /, /radiobloom.mp3, /radio.mp3, /stream.mp3 + opus tier
-    if ((STREAM_PATHS.has(path) || path === "/opus" || path === "/stream/opus") && (req.method === "GET" || req.method === "HEAD")) {
+    // Literal: /mp3 y /opus (además de alias legacy)
+    if (STREAM_PATHS.has(path) && (req.method === "GET" || req.method === "HEAD")) {
       if (state.clients.size >= config.maxListeners) {
         return new Response("Server at max listeners", { status: 503, headers: corsHeaders() });
       }
