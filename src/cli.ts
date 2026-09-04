@@ -217,9 +217,13 @@ if (shouldWizard) {
         validate: (v: string) => !v || isValidPort(v) ? true : "Port must be 1-65535",
       },
       {
-        type: "confirm",
+        type: "list",
         name: "wantFallback",
-        message: "Enable fallback music? (no = live-only, silence until SRT)",
+        message: "Fallback music?",
+        choices: [
+          { name: "Yes — with music folder", value: true },
+          { name: "No — live-only (silence until SRT)", value: false },
+        ],
         default: (() => {
           const v = process.env.FALLBACK_SOURCE;
           // "" explicitly means no fallback; undefined means default with music
