@@ -74,7 +74,7 @@ server.tool("push_to_queue", {
   },
   handler: async ({ file }: any) => {
     try {
-      if (!file || typeof file !== "string") throw new Error("Parámetro 'file' inválido");
+      if (!file || typeof file !== "string") throw new Error("Parameter 'file' invalid");
       state.fallbackQueue.push(file);
       return {
         content: [{ type: "text", text: JSON.stringify({ success: true, queue: state.fallbackQueue }, null, 2) }],
@@ -101,7 +101,7 @@ server.tool("remove_from_queue", {
   handler: async ({ index }: any) => {
     try {
       const idx = Number(index);
-      if (Number.isNaN(idx) || idx < 0 || idx >= state.fallbackQueue.length) throw new Error("Parámetro 'index' fuera de rango");
+      if (Number.isNaN(idx) || idx < 0 || idx >= state.fallbackQueue.length) throw new Error("Parameter 'index' out of range");
       state.fallbackQueue.splice(idx, 1);
       return {
         content: [{ type: "text", text: JSON.stringify({ success: true, queue: state.fallbackQueue }, null, 2) }],
@@ -173,10 +173,10 @@ server.tool("skip_track", {
       if (!state.isBroadcasting && state.currentTrack) {
         actionSkipFallback();
         return {
-          content: [{ type: "text", text: JSON.stringify({ success: true, message: "Saltando canción..." }, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify({ success: true, message: "Skipping track..." }, null, 2) }],
         };
       }
-      throw new Error("El vivo no se puede saltar, detén el stream desde OBS o no hay pista activa");
+      throw new Error("Live cannot be skipped, stop stream from OBS or no active track");
     } catch (error: any) {
       return {
         content: [{ type: "text", text: `Error: ${error.message}` }],

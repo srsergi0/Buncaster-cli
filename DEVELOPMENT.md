@@ -34,7 +34,6 @@ bunradio/
 │   ├── audio-router.ts     # Motor de audio principal
 │   ├── broadcaster.ts      # Fan-out a oyentes
 │   ├── pre-buffer.ts       # Buffer para conexión instantánea
-│   ├── dsp.ts              # Cadena de procesamiento de audio
 │   ├── lame-ffi.ts         # Encoder MP3 nativo via FFI
 │   ├── http-server.ts      # Servidor HTTP + API
 │   ├── http-helpers.ts     # Utilidades HTTP

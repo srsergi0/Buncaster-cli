@@ -7,13 +7,38 @@ function ts(): string {
   return new Date().toISOString();
 }
 
+function appendFileLog(scope: string, level: string, args: unknown[]) {
+  try {
+    const line = `[${ts()}] ${level} [${scope}] ${args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
+    // No reinicia terminal -- escribe a archivo persistente
+    require("fs").appendFileSync("opus-debug.log", line);
+    require("fs").appendFileSync("bunradio.log", line);
+  } catch {}
+}
+
 function makeLogger(scope: string) {
   const enabled = (level: LogLevel) => LOG_LEVELS[level] >= LOG_LEVELS[config.logLevel];
   return {
-    debug: (...args: unknown[]) => enabled("debug") && console.debug(`[${ts()}] DEBUG [${scope}]`, ...args),
-    info: (...args: unknown[]) => enabled("info") && console.log(`[${ts()}] INFO  [${scope}]`, ...args),
-    warn: (...args: unknown[]) => enabled("warn") && console.warn(`[${ts()}] WARN  [${scope}]`, ...args),
-    error: (...args: unknown[]) => enabled("error") && console.error(`[${ts()}] ERROR [${scope}]`, ...args),
+    debug: (...args: unknown[]) => {
+      if (!enabled("debug")) return;
+      console.debug(`[${ts()}] DEBUG [${scope}]`, ...args);
+      appendFileLog(scope, "DEBUG", args);
+    },
+    info: (...args: unknown[]) => {
+      if (!enabled("info")) return;
+      console.log(`[${ts()}] INFO  [${scope}]`, ...args);
+      appendFileLog(scope, "INFO", args);
+    },
+    warn: (...args: unknown[]) => {
+      if (!enabled("warn")) return;
+      console.warn(`[${ts()}] WARN  [${scope}]`, ...args);
+      appendFileLog(scope, "WARN", args);
+    },
+    error: (...args: unknown[]) => {
+      if (!enabled("error")) return;
+      console.error(`[${ts()}] ERROR [${scope}]`, ...args);
+      appendFileLog(scope, "ERROR", args);
+    },
   };
 }
 

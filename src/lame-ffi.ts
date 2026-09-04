@@ -71,14 +71,14 @@ export function isNativeLameAvailable(): boolean {
         lame_close: { args: ["ptr"], returns: "i32" },
       });
       symbols = lib.symbols as unknown as LameSymbols;
-      rtmpLog.info(`[LAME-FFI] libmp3lame cargada desde ${path}`);
+      rtmpLog.info(`[LAME-FFI] libmp3lame loaded from ${path}`);
       return true;
     } catch {
       // intentar siguiente ruta
     }
   }
   rtmpLog.warn(
-    "[LAME-FFI] No se pudo cargar libmp3lame. Usando fallback ffmpeg para encoding MP3.",
+    "[LAME-FFI] Could not load libmp3lame. Using ffmpeg fallback for MP3 encoding.",
   );
   return false;
 }
@@ -100,7 +100,7 @@ export class LameEncoder {
     const s = symbols;
 
     this.lame = s.lame_init();
-    if (!this.lame) throw new Error("lame_init() devolvió NULL");
+    if (!this.lame) throw new Error("lame_init() returned NULL");
 
     s.lame_set_in_samplerate(this.lame, sampleRate);
     s.lame_set_num_channels(this.lame, channels);
@@ -118,7 +118,7 @@ export class LameEncoder {
     if (ret !== 0) {
       s.lame_close(this.lame);
       this.lame = 0;
-      throw new Error(`lame_init_params() falló (código ${ret})`);
+      throw new Error(`lame_init_params() failed (code ${ret})`);
     }
 
     // Buffer de salida MP3 pre-asignado y reutilizable.
@@ -155,7 +155,7 @@ export class LameEncoder {
     );
 
     if (written < 0) {
-      rtmpLog.error(`[LAME-FFI] error de encoding: ${written}`);
+      rtmpLog.error(`[LAME-FFI] encoding error: ${written}`);
       return new Uint8Array(0);
     }
 

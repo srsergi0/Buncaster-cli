@@ -14,7 +14,7 @@ export function evictClient(id: string, reason: string): void {
     /* noop */
   }
   state.clients.delete(id);
-  httpLog.info(`Oyente ${id} desconectado (${reason}). Activos: ${state.clients.size}`);
+  httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size}`);
 }
 
 function getCurrentTitle(): string {
@@ -49,7 +49,7 @@ export function broadcast(chunk: Uint8Array): void {
     if (desiredSize !== null && desiredSize < 0) {
       client.slowStrikes++;
       if (client.slowStrikes >= MAX_SLOW_STRIKES) {
-        evictClient(id, "no puede seguir el ritmo del stream (buffer saturado)");
+        evictClient(id, "cannot keep up with stream (buffer saturated)");
       }
     } else {
       client.slowStrikes = 0;
@@ -77,7 +77,7 @@ export function broadcastOpus(chunk: Uint8Array): void {
     if (desiredSize !== null && desiredSize < 0) {
       client.slowStrikes++;
       if (client.slowStrikes >= MAX_SLOW_STRIKES) {
-        evictClient(id, "no puede seguir el ritmo del stream opus (buffer saturado)");
+        evictClient(id, "cannot keep up with stream opus (buffer saturated)");
       }
     } else {
       client.slowStrikes = 0;

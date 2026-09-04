@@ -63,6 +63,6 @@ export function validateFormat(format: StreamFormat): StreamFormat {
   if (FORMAT_CONFIG[format] && isCodecAvailable(format)) {
     return format;
   }
-  rtmpLog.warn(`Codec para "${format}" no disponible, fallback a MP3`);
+  rtmpLog.warn(`Codec for "${format}" not available, fallback to MP3`);
   return "mp3";
 }

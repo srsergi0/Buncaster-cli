@@ -14,6 +14,7 @@ import {
   activeDeck,
   transitionStarted,
   isStoppingFallback,
+  opusHeaders,
 } from "./audio-router";
 
 import { StreamableHttpTransport, InMemorySessionAdapter } from "mcp-lite";
@@ -62,7 +63,7 @@ export const httpServer = Bun.serve({
     // ---- Stream de audio (dual-tier mp3 + opus) ----
     if ((path === "/stream" || path === "/" || path === "/opus" || path === "/stream/opus") && (req.method === "GET" || req.method === "HEAD")) {
       if (state.clients.size >= config.maxListeners) {
-        return new Response("Servidor al máximo de oyentes", { status: 503, headers: corsHeaders() });
+        return new Response("Server at max listeners", { status: 503, headers: corsHeaders() });
       }
 
       const opusRequested = config.opusTierEnabled && (
@@ -114,12 +115,26 @@ export const httpServer = Bun.serve({
       const stream = new ReadableStream<Uint8Array>(
         {
           start(controller) {
-            for (const chunk of chosenPreBuffer.snapshot()) {
+            // Opus necesita headers OpusHead/OpusTags para que Ogg se decodifique (ffplay/browser)
+            if (isOpus && opusHeaders) {
               try {
-                controller.enqueue(chunk);
+                controller.enqueue(opusHeaders);
               } catch {
                 /* noop */
               }
+            }
+            // Low-latency: si vivo, no enviar preBuffer (o solo 8K) para no añadir 1.6s
+            const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
+            if (shouldSendPreBuffer) {
+              for (const chunk of chosenPreBuffer.snapshot()) {
+                try {
+                  controller.enqueue(chunk);
+                } catch {
+                  /* noop */
+                }
+              }
+            } else if (config.lowLatency && state.isBroadcasting) {
+              httpLog.debug(`[HTTP] low-latency live: bypass preBuffer`);
             }
 
             state.clients.set(clientId, {
@@ -136,14 +151,14 @@ export const httpServer = Bun.serve({
             state.totalListenersServed++;
             const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
             const mp3Count = state.clients.size - opusCount;
-            httpLog.info(`Oyente conectado: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${mp3Count} opus:${opusCount})`);
+            httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${mp3Count} opus:${opusCount})`);
           },
           cancel() {
             state.clients.delete(clientId);
-            httpLog.info(`Oyente desconectado: ${clientId} tier=${tier} (${state.clients.size} activos)`);
+            httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`);
           },
         },
-        { highWaterMark: 256 * 1024 }
+        { highWaterMark: config.lowLatency ? 16 * 1024 : 256 * 1024 }
       );
 
       req.signal.addEventListener("abort", () => {
@@ -278,7 +293,7 @@ export const httpServer = Bun.serve({
         "# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier",
         "# TYPE radio_bytes_sent_opus_total counter",
         `radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,
-        "# HELP radio_fallback_active 1 si el audio de respaldo está sonando, 0 si no",
+        "# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise",
         "# TYPE radio_fallback_active gauge",
         `radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,
         "# HELP radio_opus_tier_enabled 1 si opus tier habilitado",
