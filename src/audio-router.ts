@@ -823,6 +823,8 @@ export function stopSilence() {
 }
 
 export function startFallback() {
+  // Ensure silence stops when music starts (fix: silence and fallback both writing to master caused rapid switching)
+  stopSilence();
   // No fallback: live-only silence
   if (!config.fallbackSource || config.fallbackSource.trim() === "") {
     rtmpLog.info("🔇 No music — playing silence until you go live");

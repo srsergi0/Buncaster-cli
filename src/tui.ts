@@ -160,10 +160,13 @@ export async function startTui(): Promise<void> {
 
       if (folder !== null) {
         process.env.FALLBACK_SOURCE = folder;
+        // config is already loaded (singleton) — update it directly so radio uses the chosen folder
+        (config as any).fallbackSource = folder;
       }
       // if cancelled, keep default (musica)
     } else if (wantsChoice === false) {
       process.env.FALLBACK_SOURCE = "";
+      (config as any).fallbackSource = "";
     } else {
       // null = Esc, keep default (will be musica or cwd via config)
     }
