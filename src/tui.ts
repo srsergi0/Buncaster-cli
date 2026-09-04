@@ -1,26 +1,21 @@
 #!/usr/bin/env bun
 // =============================================================
 // BunRadio TUI — Console app with mouse buttons (blessed)
+// Desde el inicio muestra: Play background music vs Silence
 // =============================================================
 import blessed from "blessed";
+import fs from "fs";
+import path from "path";
 import { config } from "./config";
 import { state } from "./state";
 import { rtmpLog } from "./logger";
 
 let screen: blessed.Widgets.Screen | null = null;
 let tuiActive = false;
-const logLines: string[] = [];
-const MAX_LOG_LINES = 100;
 
 export function isTuiActive() { return tuiActive; }
 
-export function pushTuiLog(line: string) {
-  logLines.push(line);
-  if (logLines.length > MAX_LOG_LINES) logLines.shift();
-  // if TUI log box exists, update it (will be set via closure)
-}
-
-export function startTui() {
+export async function startTui(): Promise<void> {
   tuiActive = true;
 
   screen = blessed.screen({
@@ -31,13 +26,150 @@ export function startTui() {
     dockBorders: true,
   });
 
-  // Quit keys
   screen.key(["escape", "q", "C-c"], () => {
     screen?.destroy();
     process.exit(0);
   });
 
-  // Layout
+  // ---- Initial choice from start: Play background music vs Silence (mouse) ----
+  // Only if user hasn't already set FALLBACK_SOURCE via flags/env
+  if (process.env.FALLBACK_SOURCE === undefined) {
+    const wantsChoice = await new Promise<boolean | null>((resolve) => {
+      const modal = blessed.box({
+        parent: screen!,
+        top: "center",
+        left: "center",
+        width: 60,
+        height: 12,
+        label: " Quick start ",
+        tags: true,
+        border: { type: "line" },
+        style: { border: { fg: "cyan" }, bg: "black" },
+      });
+
+      blessed.text({
+        parent: modal,
+        top: 1,
+        left: 2,
+        width: 54,
+        height: 2,
+        tags: true,
+        content: "Do you want music when you're {bold}not live{/}?",
+        style: { fg: "white" },
+      });
+
+      const btnYes = blessed.button({
+        parent: modal,
+        mouse: true,
+        keys: true,
+        shrink: true,
+        padding: { left: 2, right: 2 },
+        top: 4,
+        left: 4,
+        content: " ✅ Yes — play background music ",
+        style: {
+          bg: "green",
+          fg: "black",
+          focus: { bg: "yellow" },
+          hover: { bg: "yellow" },
+        },
+        border: { type: "line" },
+      });
+
+      const btnNo = blessed.button({
+        parent: modal,
+        mouse: true,
+        keys: true,
+        shrink: true,
+        padding: { left: 2, right: 2 },
+        top: 4,
+        left: 34,
+        content: " 🔇 No — silence until live ",
+        style: {
+          bg: "red",
+          fg: "white",
+          focus: { bg: "yellow", fg: "black" },
+          hover: { bg: "yellow", fg: "black" },
+        },
+        border: { type: "line" },
+      });
+
+      blessed.text({
+        parent: modal,
+        top: 7,
+        left: 2,
+        width: 54,
+        height: 1,
+        tags: true,
+        content: "{grey-fg}Click with mouse or Tab+Enter  •  Esc to keep default{/}",
+        style: { fg: "white" },
+      });
+
+      btnYes.on("press", () => {
+        modal.destroy();
+        screen!.render();
+        resolve(true);
+      });
+      btnNo.on("press", () => {
+        modal.destroy();
+        screen!.render();
+        resolve(false);
+      });
+
+      // Esc keeps default (silence? or with music if musica exists)
+      modal.key(["escape"], () => {
+        modal.destroy();
+        screen!.render();
+        resolve(null);
+      });
+
+      btnYes.focus();
+      screen!.render();
+    });
+
+    if (wantsChoice === true) {
+      // Ask folder with blessed.prompt (mouse + keyboard)
+      const cwd = process.cwd();
+      const musicDefault = (() => {
+        if (fs.existsSync(path.join(cwd, "musica"))) return "musica";
+        if (fs.existsSync(path.join(cwd, "music"))) return "music";
+        return "musica";
+      })();
+
+      const folder = await new Promise<string | null>((resolve) => {
+        const prompt = blessed.prompt({
+          parent: screen!,
+          top: "center",
+          left: "center",
+          width: 60,
+          height: 8,
+          label: " Music folder ",
+          tags: true,
+          border: { type: "line" },
+          style: { border: { fg: "green" } },
+        });
+        prompt.input("Where is your music? (folder)", musicDefault, (err, value) => {
+          prompt.destroy();
+          screen!.render();
+          if (err || value === undefined) resolve(null);
+          else resolve(value.trim() || musicDefault);
+        });
+        // blessed.prompt handles mouse via screen
+        screen!.render();
+      });
+
+      if (folder !== null) {
+        process.env.FALLBACK_SOURCE = folder;
+      }
+      // if cancelled, keep default (musica)
+    } else if (wantsChoice === false) {
+      process.env.FALLBACK_SOURCE = "";
+    } else {
+      // null = Esc, keep default (will be musica or cwd via config)
+    }
+  }
+
+  // ---- Main TUI layout (after initial choice) ----
   const header = blessed.box({
     top: 0,
     left: 0,
@@ -103,7 +235,6 @@ export function startTui() {
     border: { type: "line" },
   });
 
-  // Buttons row inside header or main
   const btnMP3 = blessed.button({
     parent: main,
     mouse: true,
@@ -180,22 +311,18 @@ export function startTui() {
     border: { type: "line" },
   });
 
-  // Append
   screen!.append(header);
   screen!.append(main);
   screen!.append(side);
   screen!.append(logBox);
   screen!.append(help);
 
-  // Focus
   btnMP3.focus();
   screen!.render();
 
-  // Mouse + key handlers
   btnMP3.on("press", () => {
     const url = `http://localhost:${config.httpPort}/mp3`;
     logBox.log(`{green-fg}▶ Opening MP3: ${url}{/}`);
-    // Try to open via xdg-open if available, else just copy to log
     try { Bun.spawn(["xdg-open", url], { stdout: "ignore", stderr: "ignore" }); } catch {}
     screen!.render();
   });
@@ -224,18 +351,13 @@ export function startTui() {
     setTimeout(() => process.exit(0), 300);
   });
 
-  // Update main/side every 1s with live state
   const update = () => {
-    const mp3Count = [...state.clients.values()].filter(c => c.tier === "opus").length;
-    // Actually opus count is opus tier
     const opusCount = [...state.clients.values()].filter(c => c.tier === "opus").length;
     const mp3Listeners = state.clients.size - opusCount;
     const statusColor = state.isBroadcasting ? "{red-fg}● LIVE{/}" : "{yellow-fg}○ Silence{/}";
     const musicInfo = state.currentTrack
       ? `🎵 ${state.currentTrack.title || state.currentTrack.file.split("/").pop()}`
-      : config.fallbackSource
-        ? `🎵 ${config.fallbackSource}`
-        : "🔇 live-only";
+      : (process.env.FALLBACK_SOURCE === "" ? "🔇 live-only" : config.fallbackSource ? `🎵 ${config.fallbackSource}` : "🔇 live-only");
 
     main.setContent(
       `  {bold}Streams:{/}\n` +
@@ -264,13 +386,11 @@ export function startTui() {
     screen!.render();
   };
 
-  // Hook logger to TUI logBox as well (instead of console)
   const origInfo = rtmpLog.info;
   const origWarn = rtmpLog.warn;
   const origError = rtmpLog.error;
   const origDebug = rtmpLog.debug;
 
-  // Patch to also push to logBox (keep console for file, but also UI)
   (rtmpLog as any).info = (...args: unknown[]) => {
     origInfo(...args);
     try { logBox.log(`INFO  ${args.join(" ")}`); screen!.render(); } catch {}
@@ -285,27 +405,21 @@ export function startTui() {
   };
   (rtmpLog as any).debug = (...args: unknown[]) => {
     origDebug(...args);
-    // debug not shown in TUI unless needed
   };
 
-  // Initial update + interval
   update();
   const iv = setInterval(update, 1000);
 
   screen!.on("destroy", () => clearInterval(iv));
-
-  // Handle resize
   screen!.on("resize", () => {
     screen!.render();
   });
 
-  return screen;
+  return;
 }
 
 // If run directly: bun run src/tui.ts
 if (import.meta.main) {
-  // For standalone test, start TUI without radio (or with)
-  startTui();
-  // Keep alive
+  await startTui();
   setInterval(() => {}, 1000);
 }

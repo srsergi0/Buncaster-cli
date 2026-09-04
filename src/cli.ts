@@ -172,8 +172,13 @@ const hasAnyFlag =
   values["max-listeners"] !== undefined;
 
 const isTTY = process.stdin.isTTY && process.stdout.isTTY;
-const shouldWizard =
-  values.interactive ? true : values.yes ? false : !hasAnyFlag && isTTY;
+// TUI is default for interactive TTY (common user wants mouse buttons from start)
+const wantsTuiExplicit = has("--tui") || !!values["tui"];
+const wantsNoTui = has("--no-tui") || !!values["no-tui"];
+const useTuiDefault = isTTY && !values.yes;
+const useTuiEarly = wantsNoTui ? false : wantsTuiExplicit ? true : useTuiDefault;
+// Wizard only if not TUI (TUI will handle its own initial choice with mouse)
+const shouldWizard = !useTuiEarly && (values.interactive ? true : values.yes ? false : !hasAnyFlag && isTTY);
 
 function isValidPort(v: string): boolean {
   const n = Number(v);
@@ -289,17 +294,10 @@ if (shouldWizard) {
 // ---------- launch server (dynamic import after env is set) ----------
 // This must be dynamic so src/config.ts reads the updated process.env
 // and src/http-server.ts binds to the correct ports.
-// Common user: launch TUI console app with mouse buttons instead of plain logs.
-
-const useTui = (() => {
-  if (has("--no-tui") || values["no-tui"]) return false;
-  if (has("--tui") || values["tui"]) return true;
-  // Default: interactive TTY -> TUI, non-TTY/Docker/--yes -> plain logs
-  return shouldWizard || (isTTY && !values.yes);
-})();
+// Common user: TUI with mouse buttons from start (handles its own fallback choice)
 
 try {
-  if (useTui) {
+  if (useTuiEarly) {
     process.env.BUNRADIO_TUI = "1";
     const { startTui } = await import("./tui.ts");
     startTui();
