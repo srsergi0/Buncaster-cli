@@ -183,50 +183,31 @@ let wizardAnswers: Record<string, any> = {};
 
 if (shouldWizard) {
   console.log("\n  ╔══════════════════════════════════════════════════╗");
-  console.log("  ║           🎙️  B U N R A D I O  CLI             ║");
-  console.log("  ║         Interactive setup (Inquirer.js)          ║");
+  console.log("  ║           🎙️  B U N R A D I O                  ║");
+  console.log("  ║      ¡Tu radio en 10 segundos! 🚀               ║");
   console.log("  ╚══════════════════════════════════════════════════╝\n");
-  console.log("  Leave empty for defaults (zero-config). Press Enter to keep default.\n");
 
-  // Suggest music default: check ./musica, ./music, or cwd
+  // Detecta carpeta de música si existe
   const cwd = process.cwd();
   const musicDefault = process.env.FALLBACK_SOURCE ?? (() => {
     if (fs.existsSync(path.join(cwd, "musica"))) return "musica";
     if (fs.existsSync(path.join(cwd, "music"))) return "music";
-    return cwd;
+    return "musica";
   })();
 
-  const defaultPort = process.env.PORT || "8080";
-  const defaultSrt = process.env.SRT_PORT || "1936";
-  const defaultKey = process.env.RTMP_STREAM_KEY || crypto.randomBytes(8).toString("hex"); // short preview, full gen in config
-
   try {
+    // ULTRA RÁPIDO: solo 1-2 preguntas, sin jerga técnica
     wizardAnswers = await inquirer.prompt([
-      {
-        type: "input",
-        name: "port",
-        message: "HTTP port (PORT):",
-        default: defaultPort,
-        validate: (v: string) => !v || isValidPort(v) ? true : "Port must be 1-65535",
-      },
-      {
-        type: "input",
-        name: "srtPort",
-        message: "SRT port UDP (SRT_PORT):",
-        default: defaultSrt,
-        validate: (v: string) => !v || isValidPort(v) ? true : "Port must be 1-65535",
-      },
       {
         type: "select",
         name: "wantFallback",
-        message: "Fallback music?",
+        message: "¿Quieres música cuando no estás en vivo?",
         choices: [
-          { name: "Yes — with music folder", value: true },
-          { name: "No — live-only (silence until SRT)", value: false },
+          { name: "✅ Sí — poné música de fondo", value: true },
+          { name: "🔇 No — solo silencio hasta que transmita", value: false },
         ],
         default: (() => {
           const v = process.env.FALLBACK_SOURCE;
-          // "" explicitly means no fallback; undefined means default with music
           if (v === "") return false;
           return true;
         })(),
@@ -234,56 +215,17 @@ if (shouldWizard) {
       {
         type: "input",
         name: "music",
-        message: "Music fallback folder (FALLBACK_SOURCE):",
+        message: "¿Dónde está tu música? (carpeta)",
         default: musicDefault,
         when: (answers: any) => answers.wantFallback === true,
-        validate: (v: string) => v.trim() !== "" ? true : "Enter a folder path or choose No at previous step",
-      },
-      {
-        type: "confirm",
-        name: "opus",
-        message: "Enable Opus tier 96k (eco, /stream?format=opus)?",
-        default: (process.env.ENABLE_OPUS_TIER ?? "true") === "true",
-      },
-      {
-        type: "confirm",
-        name: "lowLatency",
-        message: "Low-latency pipeline (8K prebuffer, 0.2s live crossfade)?",
-        default: (process.env.LOW_LATENCY ?? "true") === "true",
-      },
-      {
-        type: "input",
-        name: "streamKey",
-        message: "Stream key (RTMP_STREAM_KEY, empty = auto-generate):",
-        default: process.env.RTMP_STREAM_KEY || "",
-      },
-      {
-        type: "select",
-        name: "logLevel",
-        message: "Log level:",
-        choices: [
-          { name: "info", value: "info" },
-          { name: "debug", value: "debug" },
-          { name: "warn", value: "warn" },
-          { name: "error", value: "error" },
-        ],
-        default: process.env.LOG_LEVEL || "info",
+        validate: (v: string) => v.trim() !== "" ? true : "Escribí una carpeta, ej: musica",
       },
     ]);
 
-    // confirm before launch (still inside try so Ctrl+C is handled)
-    const { confirmStart } = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "confirmStart",
-        message: "Start radio with this config?",
-        default: true,
-      },
-    ]);
-    if (!confirmStart) {
-      console.log("\n  Aborted. Run `bunradio --yes` for zero-config.\n");
-      process.exit(0);
-    }
+    // Listo — arrancamos sin más preguntas (avanzado via flags: --port, --opus, etc.)
+    console.log("\n  ✨ ¡Perfecto! Levantando tu radio...\n");
+    // pequeño delay para UX ultra rápido
+    await new Promise((r) => setTimeout(r, 300));
   } catch (e: any) {
     if (e?.name === "ExitPromptError" || e?.name === "CancelPromptError" || e?.message?.includes("User force closed")) {
       console.log("\n  ✖ Wizard cancelled.\n");
@@ -306,19 +248,11 @@ function setEnv(key: string, val: string | undefined) {
 }
 
 if (shouldWizard) {
-  // wizard overrides (only if not empty)
-  if (wizardAnswers.port) setEnv("PORT", String(wizardAnswers.port).trim());
-  if (wizardAnswers.srtPort) setEnv("SRT_PORT", String(wizardAnswers.srtPort).trim());
+  // wizard ultra rápido: solo fallback (el resto via flags --port, --opus, etc. para avanzados)
   if (wizardAnswers.wantFallback === false) {
     process.env.FALLBACK_SOURCE = "";
   } else if (wizardAnswers.music !== undefined) {
-    // allow "" for live-only (should not happen when wantFallback=true, but keep)
     process.env.FALLBACK_SOURCE = String(wizardAnswers.music);
-  }
-  if (wizardAnswers.opus !== undefined) process.env.ENABLE_OPUS_TIER = wizardAnswers.opus ? "true" : "false";
-  if (wizardAnswers.lowLatency !== undefined) process.env.LOW_LATENCY = wizardAnswers.lowLatency ? "true" : "false";
-  if (wizardAnswers.streamKey !== undefined && String(wizardAnswers.streamKey).trim() !== "") {
-    process.env.RTMP_STREAM_KEY = String(wizardAnswers.streamKey).trim();
   }
   if (wizardAnswers.logLevel) process.env.LOG_LEVEL = String(wizardAnswers.logLevel);
 } else {
