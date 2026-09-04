@@ -184,10 +184,10 @@ let wizardAnswers: Record<string, any> = {};
 if (shouldWizard) {
   console.log("\n  ╔══════════════════════════════════════════════════╗");
   console.log("  ║           🎙️  B U N R A D I O                  ║");
-  console.log("  ║      ¡Tu radio en 10 segundos! 🚀               ║");
+  console.log("  ║      Your radio in 10 seconds! 🚀               ║");
   console.log("  ╚══════════════════════════════════════════════════╝\n");
 
-  // Detecta carpeta de música si existe
+  // Detect music folder if exists
   const cwd = process.cwd();
   const musicDefault = process.env.FALLBACK_SOURCE ?? (() => {
     if (fs.existsSync(path.join(cwd, "musica"))) return "musica";
@@ -196,15 +196,15 @@ if (shouldWizard) {
   })();
 
   try {
-    // ULTRA RÁPIDO: solo 1-2 preguntas, sin jerga técnica
+    // ULTRA FAST: 1-2 questions, no jargon
     wizardAnswers = await inquirer.prompt([
       {
         type: "select",
         name: "wantFallback",
-        message: "¿Quieres música cuando no estás en vivo?",
+        message: "Do you want music when you're not live?",
         choices: [
-          { name: "✅ Sí — poné música de fondo", value: true },
-          { name: "🔇 No — solo silencio hasta que transmita", value: false },
+          { name: "✅ Yes — play background music", value: true },
+          { name: "🔇 No — silence until you go live", value: false },
         ],
         default: (() => {
           const v = process.env.FALLBACK_SOURCE;
@@ -215,15 +215,15 @@ if (shouldWizard) {
       {
         type: "input",
         name: "music",
-        message: "¿Dónde está tu música? (carpeta)",
+        message: "Where is your music? (folder)",
         default: musicDefault,
         when: (answers: any) => answers.wantFallback === true,
-        validate: (v: string) => v.trim() !== "" ? true : "Escribí una carpeta, ej: musica",
+        validate: (v: string) => v.trim() !== "" ? true : "Enter a folder, e.g. musica",
       },
     ]);
 
-    // Listo — arrancamos sin más preguntas (avanzado via flags: --port, --opus, etc.)
-    console.log("\n  ✨ ¡Perfecto! Levantando tu radio...\n");
+    // Done — start directly (advanced via flags: --port, --opus, etc.)
+    console.log("\n  ✨ Perfect! Starting your radio...\n");
     // pequeño delay para UX ultra rápido
     await new Promise((r) => setTimeout(r, 300));
   } catch (e: any) {
