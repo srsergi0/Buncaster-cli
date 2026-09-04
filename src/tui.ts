@@ -176,22 +176,19 @@ export async function startTui(): Promise<void> {
     noCellBorders: true,
   } as any);
 
-  // Logs — bottom 30%
-  const logBox = blessed.log({
-    top: "53%", left: 0, width: "100%", height: "40%",
-    label: "  ▤  LOGS  —  bunradio.log  (filtered)  ", tags: true,
-    border: { type: "line" }, style: { fg: NEON.grey, bg: NEON.panelBg, border: { fg: "#2a2f3a" }, label: { fg: NEON.grey } },
-    scrollable: true, alwaysScroll: true, mouse: true,
-    scrollbar: { ch: "▐", style: { bg: "#2a2f3a" } },
-  });
+  // Logs removed per user request — TUI is now fullscreen without log spam
+  const logBox = { log: (..._a: any[]) => {}, setContent: () => {} } as any;
 
-  // Footer — command bar
+  // Footer — command bar (now more height for buttons, no logs covering)
   const footer = blessed.box({
     bottom: 0, left: 0, width: "100%", height: 1,
     tags: true,
     content: ` {bold}{${NEON.cyan}-fg}BUNRADIO{/} {grey-fg}•{/} {bold}M{/}usic  {grey-fg}│{/} {bold}H{/}ealth  {grey-fg}│{/} {bold}Q{/}uit  {grey-fg}│{/} {bold}Tab{/} focus  {grey-fg}│{/} {bold}Click{/} buttons  {grey-fg}•  ${new Date().toLocaleTimeString()}{/}`,
     style: { fg: "white", bg: "#0f1419" },
   });
+
+  // No logs panel — buttons now fully visible, responsive handles extra height
+  const _logBoxPlaceholder = logBox;
 
   // Buttons — MP3 + OPUS together (only these in Streams, as requested)
   const mkBtn = (opts: any) => blessed.button({
@@ -238,26 +235,24 @@ export async function startTui(): Promise<void> {
     border: { type: "line" },
   });
 
-  // ── responsive ───────────────────────────────────────────────
+  // ── responsive — no logs panel, so panels use all space, buttons never covered
   const applyResponsive = () => {
     const w = (screen as any).width as number;
     const narrow = w < 100;
     const tiny = w < 70;
     if (narrow) {
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "18%";
-      (streamBox as any).top = "23%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "20%";
-      (queueBox as any).top = "43%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "12%";
-      (queueActionBox as any).top = "55%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
-      (logBox as any).top = "61%"; (logBox as any).height = "32%";
-      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); (logBox as any).top = "43%"; (logBox as any).height = "50%"; }
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "28%";
+      (streamBox as any).top = "33%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "28%";
+      (queueBox as any).top = "61%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "20%";
+      (queueActionBox as any).top = "81%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
+      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); }
       else { (queueBox as any).show(); (queueActionBox as any).show(); }
     } else {
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "42%";
-      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "42%";
-      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "42%";
-      (queueActionBox as any).top = "47%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "80%";
+      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "80%";
+      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "74%";
+      (queueActionBox as any).top = "79%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
       (queueBox as any).show();
-      (logBox as any).top = "53%"; (logBox as any).height = "40%";
     }
     screen!.render();
   };
@@ -267,7 +262,7 @@ export async function startTui(): Promise<void> {
   screen.append(streamBox);
   screen.append(queueBox);
   screen.append(queueActionBox);
-  screen.append(logBox);
+  // logBox removed — no more covering buttons
   screen.append(footer);
   applyResponsive();
   btnMP3.focus();
