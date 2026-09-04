@@ -24,11 +24,9 @@ console.log("  ╚════════════════════�
 console.log("");
 console.log("  ▸ STREAM (Listen):");
 console.log(`    http://localhost:${config.httpPort}/mp3`);
-console.log(`    http://localhost:${config.httpPort}/stream  (alias)`);
 console.log("");
 console.log(`  ▸ STREAM Opus (eco 96k):`);
 console.log(`    http://localhost:${config.httpPort}/opus`);
-console.log(`    http://localhost:${config.httpPort}/stream?format=opus  (alias)`);
 console.log("");
 console.log("  ▸ SEND FROM OBS STUDIO (SRT - no plan B):");
 console.log("    Service:   Custom");

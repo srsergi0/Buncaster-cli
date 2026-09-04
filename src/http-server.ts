@@ -3,9 +3,8 @@ import { state } from "./state";
 import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
 
-// Rutas que sirven el stream de audio (alias de estación)
-// Literal: /mp3 (320k) y /opus (96k) — ultra simple para usuario común
-const STREAM_PATHS = new Set(["/stream", "/", "/mp3", "/opus", "/radiobloom.mp3", "/radio.mp3", "/stream.mp3", "/stream/opus"]);
+// Rutas literales: /mp3 (320k) y /opus (96k) — solo estas
+const STREAM_PATHS = new Set(["/mp3", "/opus"]);
 import {
   corsHeaders,
   checkStreamKey,
