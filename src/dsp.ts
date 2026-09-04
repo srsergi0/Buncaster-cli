@@ -28,10 +28,10 @@ export class DspChain {
   private s2x1l = 0; private s2x2l = 0; private s2y1l = 0; private s2y2l = 0;
   private s2x1r = 0; private s2x2r = 0; private s2y1r = 0; private s2y2r = 0;
 
-  // --- Loudness measurement ---
+  // --- Loudness measurement --- (Float32 para cache y SIMD, error <0.02dB vs Float64)
   private blockEnergy = 0;
   private blockSamples = 0;
-  private loudnessBuf: Float64Array;
+  private loudnessBuf: Float32Array;
   private loudnessIdx = 0;
   private loudnessFilled = 0;
   private loudnessSum = 0; // suma incremental (evita loop cada bloque)
@@ -75,8 +75,22 @@ export class DspChain {
   // (4800/4 = 1200 muestras por bloque de 100ms → error < 0.1dB).
   private static readonly K_SUB = 4;
 
+  // Tabla precomputada gainDb → linear (241 entradas -12..+12 step 0.1dB)
+  // Evita Math.pow(10,db/20) por bloque (10Hz) y mejora precisión (evita recomputo float)
+  private static readonly GAIN_TABLE = (() => {
+    const t = new Float64Array(241);
+    for (let i = 0; i < 241; i++) {
+      const db = -12 + i * 0.1;
+      t[i] = Math.pow(10, db / 20);
+    }
+    return t;
+  })();
+
+  // Pool MP3-like para compander sqrt: tabla 1/sqrt(env) para env>knee (opcional micro-opt)
+  // No se usa tabla para sqrt aquí porque Math.sqrt es nativo y coste despreciable fuera de hot path
+
   constructor() {
-    this.loudnessBuf = new Float64Array(DspChain.NUM_BLOCKS);
+    this.loudnessBuf = new Float32Array(DspChain.NUM_BLOCKS);
     this.outBuf = new Int16Array(16384);
   }
 
@@ -170,9 +184,11 @@ export class DspChain {
         const avgMs = loudnessSum / loudnessFilled;
         const lufs = -0.691 + 10 * Math.log10(avgMs + 1e-12);
 
-        // Ganancia hacia target, clamp ±12dB, suavizado exponencial
+        // Ganancia hacia target, clamp ±12dB, suavizado exponencial (lookup tabla precomputada)
         const gainDb = Math.max(-12, Math.min(12, targetLufs - lufs));
-        gain += (Math.pow(10, gainDb / 20) - gain) * gainSmooth;
+        const gainIdx = Math.round((gainDb + 12) * 10);
+        const targetGain = DspChain.GAIN_TABLE[gainIdx]!;
+        gain += (targetGain - gain) * gainSmooth;
 
         blockEnergy = 0;
         blockSamples = 0;

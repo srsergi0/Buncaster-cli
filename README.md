@@ -2,7 +2,7 @@
 
 **Tu radio en un solo binario. Sin Node, sin npm.**
 
-Servidor de radio profesional built con **Bun** y **FFmpeg**. Acepta streaming en vivo desde OBS Studio via RTMP, genera una stream MP3 continua y gapless para oyentes, con sistema de fallback musical y panel de DJ web.
+Servidor de radio profesional built con **Bun** y **FFmpeg**. Acepta streaming en vivo desde OBS Studio via RTMP, genera una stream MP3 continua y gapless para oyentes, con sistema de fallback musical.
 
 ---
 
@@ -47,7 +47,6 @@ BunRadio funciona **sin configuración**. Ejecuta el binario y:
 | **Música fallback** | Directorio donde se ejecuta el binario |
 | **Procesamiento de audio** | Activado por defecto (limiter + compressor) |
 | **Crossfade** | 2 segundos entre canciones |
-| **Panel admin** | Requiere stream key (Bearer) o Basic Auth |
 
 ### Formato de stream
 
@@ -72,25 +71,11 @@ docker run -e STREAM_FORMAT=ogg -p 8080:8080 -p 1935:1935 \
 Solo edita lo que quieras cambiar via variables de entorno o archivo `.env`:
 
 ```bash
-# Ejemplo: cambiar puerto y poner contraseña al admin
+# Ejemplo: cambiar puerto
 PORT=9090
-ADMIN_USER=dj
-ADMIN_PASSWORD=mipassword
 ```
 
 Ver `.env.example` para todas las opciones.
-
----
-
-## 🖥️ Panel de DJ Web
-
-Accede a `http://localhost:8080/admin` para controlar tu radio:
-
-- **Now Playing**: Info de la canción actual con barra de progreso
-- **Controles**: Saltar canción, pausar/reanudar fallback, re-shuffle
-- **Cola de reproducción**: Agregar, eliminar, reordenar canciones
-- **Biblioteca**: Explorar y reproducir archivos de música
-- **Métricas**: Oyentes conectados, bytes enviados, bitrate detectado
 
 ---
 
@@ -113,18 +98,6 @@ Accede a `http://localhost:8080/admin` para controlar tu radio:
 | `GET /health` | GET | Health check con diagnósticos |
 | `GET /status` | GET | Estado de la estación (JSON) |
 | `GET /metrics` | GET | Métricas Prometheus |
-| `GET /admin` | GET | Panel DJ web |
-| `GET /admin/api/events` | GET | Server-Sent Events |
-| `GET /admin/api/current` | GET | Pista actual |
-| `GET /admin/api/files` | GET | Biblioteca de audio |
-| `GET /admin/api/queue` | GET | Cola de reproducción |
-| `POST /admin/api/queue/push` | POST | Agregar a la cola |
-| `POST /admin/api/queue/remove` | POST | Eliminar de la cola |
-| `POST /admin/api/queue/clear` | POST | Limpiar cola |
-| `POST /admin/api/queue/move` | POST | Reordenar cola |
-| `POST /admin/api/skip` | POST | Saltar pista actual |
-| `POST /admin/api/playlist/shuffle` | POST | Re-shuffle playlist |
-| `POST /admin/api/fallback/toggle` | POST | Pausar/reanudar fallback |
 
 ---
 
@@ -152,16 +125,8 @@ Docker incluye `HEALTHCHECK` automático cada 30 segundos.
 
 El **stream key** (que aparece en la consola al iniciar) se usa como token de autenticación para las rutas protegidas. Pásalo como `Bearer` token:
 
-```bash
-# Ejemplo: skip con curl
-curl -X POST http://localhost:8080/admin/api/skip \
-  -H "Authorization: Bearer TU_STREAM_KEY"
-```
-
 | Ruta | Método | Protección |
 |------|--------|------------|
-| `/admin` | GET | Stream key (Bearer) o Basic Auth |
-| `/admin/api/*` | POST | Stream key (Bearer) o Basic Auth |
 | `/mcp` | POST | Stream key (Bearer) |
 | `/stream` | GET | Abierto |
 | `/health` | GET | Abierto |

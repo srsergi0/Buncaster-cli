@@ -25,11 +25,6 @@ console.log("");
 console.log("  ▸ STREAM (Escuchar):");
 console.log(`    http://localhost:${config.httpPort}/stream`);
 console.log("");
-console.log("  ▸ PANEL DE CONTROL:");
-console.log(`    http://localhost:${config.httpPort}/admin`);
-if (config.adminUser) {
-  console.log(`    Usuario: ${config.adminUser}`);
-}
 console.log("");
 console.log("  ▸ ENVIAR DESDE OBS STUDIO:");
 console.log("    Servicio:   Custom");

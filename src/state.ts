@@ -9,6 +9,7 @@ export interface RadioClient {
   bytesSent: number;
   slowStrikes: number;
   icy?: IcyClientState;
+  tier: "mp3" | "opus";
 }
 
 export interface ActiveTrackInfo {
@@ -25,17 +26,17 @@ export const state = {
   sourceConnected: false,
   sourceProcess: null as any | null,
   masterProcess: null as any | null,
+  opusProcess: null as any | null,
   shuttingDown: false,
   startTime: new Date(),
   totalListenersServed: 0,
   totalBytesReceived: 0,
   totalBytesSent: 0,
+  totalBytesSentOpus: 0,
   detectedBitrateKbps: null as number | null,
   detectedSampleRate: null as number | null,
 
-  // --- Propiedades para el Panel DJ Moderno ---
   fallbackQueue: [] as string[],
   currentTrack: null as ActiveTrackInfo | null,
   fallbackPaused: false,
-  sseClients: new Set<ReadableStreamDefaultController<string>>(),
 };

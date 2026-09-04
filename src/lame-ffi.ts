@@ -25,6 +25,8 @@ interface LameSymbols {
   lame_set_brate: (lame: number, brate: number) => number;
   lame_set_quality: (lame: number, quality: number) => number;
   lame_set_out_samplerate: (lame: number, rate: number) => number;
+  lame_set_VBR: (lame: number, vbr: number) => number;
+  lame_set_VBR_q: (lame: number, q: number) => number;
   lame_init_params: (lame: number) => number;
   lame_encode_buffer_interleaved: (
     lame: number,
@@ -58,6 +60,8 @@ export function isNativeLameAvailable(): boolean {
         lame_set_brate: { args: ["ptr", "i32"], returns: "i32" },
         lame_set_quality: { args: ["ptr", "i32"], returns: "i32" },
         lame_set_out_samplerate: { args: ["ptr", "i32"], returns: "i32" },
+        lame_set_VBR: { args: ["ptr", "i32"], returns: "i32" },
+        lame_set_VBR_q: { args: ["ptr", "i32"], returns: "i32" },
         lame_init_params: { args: ["ptr"], returns: "i32" },
         lame_encode_buffer_interleaved: {
           args: ["ptr", "ptr", "i32", "ptr", "i32"],
@@ -90,6 +94,7 @@ export class LameEncoder {
     channels: number,
     bitrateKbps: number,
     quality: number = 2,
+    vbrQuality?: number, // si se define 0..9, activa VBR V0..V9 (0=mejor) - mejora calidad/bandwidth sin coste CPU
   ) {
     if (!symbols) throw new Error("libmp3lame no cargada");
     const s = symbols;
@@ -99,7 +104,13 @@ export class LameEncoder {
 
     s.lame_set_in_samplerate(this.lame, sampleRate);
     s.lame_set_num_channels(this.lame, channels);
-    s.lame_set_brate(this.lame, bitrateKbps);
+    if (vbrQuality !== undefined) {
+      // VBR mtrh (4) - mejor calidad variable, bitrate medio ~150-245k para V0 vs CBR 320 fijo
+      s.lame_set_VBR(this.lame, 4);
+      s.lame_set_VBR_q(this.lame, Math.max(0, Math.min(9, vbrQuality)));
+    } else {
+      s.lame_set_brate(this.lame, bitrateKbps);
+    }
     s.lame_set_quality(this.lame, quality);
     s.lame_set_out_samplerate(this.lame, sampleRate);
 

@@ -1,5 +1,5 @@
 import { state } from "./state";
-import { preBuffer } from "./pre-buffer";
+import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
 import { chunkWithIcy } from "./icy-metadata";
 
@@ -27,6 +27,7 @@ export function broadcast(chunk: Uint8Array): void {
   preBuffer.push(chunk);
 
   for (const [id, client] of state.clients) {
+    if (client.tier !== "mp3") continue;
     try {
       if (client.icy) {
         const pieces = chunkWithIcy(chunk, client.icy, getCurrentTitle());
@@ -49,6 +50,34 @@ export function broadcast(chunk: Uint8Array): void {
       client.slowStrikes++;
       if (client.slowStrikes >= MAX_SLOW_STRIKES) {
         evictClient(id, "no puede seguir el ritmo del stream (buffer saturado)");
+      }
+    } else {
+      client.slowStrikes = 0;
+    }
+  }
+}
+
+export function broadcastOpus(chunk: Uint8Array): void {
+  preBufferOpus.push(chunk);
+
+  for (const [id, client] of state.clients) {
+    if (client.tier !== "opus") continue;
+    try {
+      // Opus via Ogg no usa icy
+      client.controller.enqueue(chunk);
+    } catch (err) {
+      evictClient(id, `fallo al enviar datos (opus): ${(err as Error).message}`);
+      continue;
+    }
+
+    client.bytesSent += chunk.byteLength;
+    state.totalBytesSentOpus += chunk.byteLength;
+
+    const desiredSize = client.controller.desiredSize;
+    if (desiredSize !== null && desiredSize < 0) {
+      client.slowStrikes++;
+      if (client.slowStrikes >= MAX_SLOW_STRIKES) {
+        evictClient(id, "no puede seguir el ritmo del stream opus (buffer saturado)");
       }
     } else {
       client.slowStrikes = 0;

@@ -2,7 +2,7 @@ import fs from "fs";
 import { config } from "./config";
 import { rtmpLog } from "./logger";
 import { state } from "./state";
-import { broadcast } from "./broadcaster";
+import { broadcast, broadcastOpus } from "./broadcaster";
 import { bitrateDetector } from "./bitrate-detector";
 import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
 import { DspChain } from "./dsp";
@@ -229,6 +229,17 @@ function applyVolume(chunk: Uint8Array, volume: number): Uint8Array {
 }
 
 function writeToMaster(chunk: Uint8Array) {
+  // Opus tier - siempre escribe PCM crudo (o procesado) al encoder opus si está habilitado
+  // Se hace primero para que opus tenga loudnorm vía ffmpeg -af si audioProcessing
+  if (config.opusTierEnabled && state.opusProcess?.stdin) {
+    try {
+      state.opusProcess.stdin.write(chunk);
+      state.opusProcess.stdin.flush();
+    } catch {
+      /* noop */
+    }
+  }
+
   if (nativeEncoder) {
     // --- Modo nativo: DSP + LAME FFI (sin ffmpeg) ---
     const frameBytes = 4; // stereo s16le = 4 bytes por frame
@@ -261,22 +272,10 @@ function writeToMaster(chunk: Uint8Array) {
   }
 }
 
-export function broadcastSse(event: string, data: unknown) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const client of state.sseClients) {
-    try {
-      client.enqueue(payload);
-    } catch {
-      state.sseClients.delete(client);
-    }
-  }
-}
-
 export function reshufflePlaylist() {
   shuffle(fallbackPlaylist);
   currentPlaylistIndex = 0;
   rtmpLog.info("[Fallback Playlist] Playlist remezclada bajo petición de la API.");
-  broadcastSse("playlist-updated", { playlist: fallbackPlaylist });
   if ((deckA.process || deckB.process) && !state.isBroadcasting) {
     stopFallback();
   }
@@ -498,7 +497,6 @@ function rescanPlaylist() {
     rtmpLog.info(
       `[Playlist Watch] Playlist reconstruida: ${removed.length} eliminada(s), ${added.length} añadida(s). Total: ${fallbackPlaylist.length} canciones.`,
     );
-    broadcastSse("playlist-updated", { playlist: fallbackPlaylist });
   } catch (err) {
     rtmpLog.error("[Playlist Watch] Error al re-escanear carpeta:", (err as Error).message);
   }
@@ -565,7 +563,10 @@ export function stopPlaylistWatcher() {
 }
 
 export function startMasterEncoder() {
-  if (state.masterProcess || nativeEncoder) return;
+  if (state.masterProcess || nativeEncoder) {
+    if (config.opusTierEnabled && !state.opusProcess) startOpusEncoder();
+    return;
+  }
 
   // --- Intentar modo nativo (LAME-FFI + DSP Bun) solo para MP3 ---
   if (config.streamFormat === "mp3" && config.useNativeLame !== "false" && isNativeLameAvailable()) {
@@ -581,6 +582,7 @@ export function startMasterEncoder() {
       rtmpLog.info(
         `[Master Encoder] Modo nativo activo (LAME-FFI${dsp ? " + DSP Bun" : ""}) a ${config.fallbackBitrateKbps}kbps. Sin proceso ffmpeg.`,
       );
+      if (config.opusTierEnabled) startOpusEncoder();
       return;
     } catch (err) {
       rtmpLog.error(
@@ -592,6 +594,7 @@ export function startMasterEncoder() {
 
   // --- Fallback: FFmpeg master encoder ---
   startFfmpegMasterEncoder();
+  if (config.opusTierEnabled) startOpusEncoder();
 }
 
 function startFfmpegMasterEncoder() {
@@ -661,7 +664,79 @@ async function pipeMaster(reader: ReadableStreamDefaultReader<Uint8Array>) {
   }
 }
 
+// --- Opus tier (moonshot per-listener efficiency) ---
+export function startOpusEncoder() {
+  if (state.opusProcess) return;
+  if (!config.opusTierEnabled) return;
+  // Verificar codec disponible
+  const opusFmt = FORMAT_CONFIG["opus"];
+  rtmpLog.info(`Iniciando Codificador Opus Tier [OPUS] a ${config.opusTierBitrateKbps}kbps...`);
+  const args = [
+    "-loglevel", "warning",
+    "-fflags", "nobuffer",
+    "-f", "s16le",
+    "-ar", "48000",
+    "-ac", "2",
+    "-i", "pipe:0",
+    ...(config.audioProcessing
+      ? ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11,compand=attacks=0:decays=1:points=-90/-90|-20/-20|0/-10"]
+      : []),
+    "-acodec", opusFmt.codec,
+    ...opusFmt.args(config.opusTierBitrateKbps),
+    "-flush_packets", "1",
+    "-f", opusFmt.muxer,
+    "-"
+  ];
+  try {
+    state.opusProcess = Bun.spawn(["ffmpeg", ...args], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const reader = state.opusProcess.stdout.getReader();
+    const proc = state.opusProcess;
+    proc.exited.then((code: number) => {
+      if (state.opusProcess === proc) {
+        rtmpLog.warn(`[Opus Tier] proceso terminado (exit ${code})`);
+        try { reader.cancel(); } catch {}
+        state.opusProcess = null;
+      }
+    }).catch(()=>{});
+    pipeOpus(reader);
+  } catch (err) {
+    rtmpLog.error("Error iniciando Opus Tier:", (err as Error).message);
+  }
+}
+
+async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        rtmpLog.info("Flujo Opus cerrado");
+        break;
+      }
+      broadcastOpus(value);
+    }
+  } catch (err) {
+    if (!state.shuttingDown) rtmpLog.error("Error leyendo Opus:", (err as Error).message);
+  }
+}
+
+export function stopOpusEncoder() {
+  if (!state.opusProcess) return;
+  rtmpLog.info("Deteniendo Opus Tier...");
+  try {
+    state.opusProcess.stdin.end();
+    state.opusProcess.kill();
+  } catch {}
+  state.opusProcess = null;
+}
+
 export function stopMasterEncoder() {
+  // Opus tier
+  stopOpusEncoder();
+
   // --- Modo nativo ---
   if (nativeEncoder) {
     rtmpLog.info("Deteniendo Codificador Maestro Nativo...");
@@ -702,7 +777,6 @@ export function startFallback() {
 
   if (state.fallbackPaused) {
     state.currentTrack = null;
-    broadcastSse("track-changed", null);
     return;
   }
 
@@ -716,7 +790,6 @@ export function startFallback() {
   let fileToPlay = "";
   if (state.fallbackQueue.length > 0) {
     fileToPlay = state.fallbackQueue.shift()!;
-    broadcastSse("queue-updated", { queue: state.fallbackQueue });
   } else {
     if (fallbackPlaylist.length === 0) {
       rtmpLog.warn("La lista de reproducción de fallback está vacía.");
@@ -744,7 +817,6 @@ export function startFallback() {
       duration: meta.duration,
       startedAt: Date.now(),
     };
-    broadcastSse("track-changed", state.currentTrack);
   });
 
   const args = [
@@ -809,8 +881,10 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
           const elapsed = Date.now() - crossfadeStartTime;
           const progress = Math.min(1.0, elapsed / (config.crossfadeSeconds * 1000));
           
-          const volOut = 1.0 - progress;
-          const volIn = progress;
+          // Equal-power crossfade (cosine) - potencia constante, evita dip -3dB de linear y pico por ganancia
+          // Solo se ejecuta durante ~2s, coste extra ~2x cos por chunk (~48Hz) despreciable
+          const volOut = Math.cos(progress * Math.PI * 0.5);
+          const volIn = Math.cos((1 - progress) * Math.PI * 0.5);
 
           const nextDeck = deck.id === "A" ? deckB : deckA;
           const otherChunk = nextDeck.buffer.pull(value.length);
@@ -909,7 +983,6 @@ export function stopFallback() {
   deckB.buffer.clear();
   
   state.currentTrack = null;
-  broadcastSse("track-changed", null);
   
   isStoppingFallback = false;
 }
@@ -1007,8 +1080,6 @@ export async function runRtmpListener() {
             rtmpLog.info(`¡Conexión RTMP establecida y transmitiendo audio en VIVO! (tras ${config.rtmpMinLiveSeconds}s de audio sostenido)`);
 
             state.currentTrack = null;
-            broadcastSse("track-changed", null);
-            broadcastSse("state-updated", { broadcasting: true, sourceConnected: true });
           }
         } else {
           firstAudioAt = 0; // Reiniciar conteo si hay un vacío de audio
@@ -1023,7 +1094,10 @@ export async function runRtmpListener() {
             const currentMusicDeck = activeDeck === "A" ? deckA : deckB;
             const fallbackChunk = currentMusicDeck.buffer.pull(value.length);
 
-            const mixed = mixSamples(value, progress, fallbackChunk, 1.0 - progress);
+            // Equal-power crossfade live (mismo coste despreciable, solo durante transición)
+            const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
+            const volFallback = Math.cos(progress * Math.PI * 0.5);
+            const mixed = mixSamples(value, volLive, fallbackChunk, volFallback);
             writeToMaster(mixed);
 
             if (progress >= 1.0) {
@@ -1054,8 +1128,6 @@ export async function runRtmpListener() {
         }
         state.sourceProcess = null;
       }
-
-      broadcastSse("state-updated", { broadcasting: false, sourceConnected: false });
 
       // Detección de flaps
       const now = Date.now();

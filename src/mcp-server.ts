@@ -1,70 +1,9 @@
 import fs from "fs";
-import path from "path";
 import { McpServer } from "mcp-lite";
 import { createInterface } from "readline";
-
-// Load .env explicitly to read configurations (like PORT, ADMIN_USER, ADMIN_PASSWORD)
-// in environments that do not load .env automatically.
-function loadEnv() {
-  const envPath = path.join(process.cwd(), ".env");
-  if (fs.existsSync(envPath)) {
-    const content = fs.readFileSync(envPath, "utf-8");
-    for (const line of content.split("\n")) {
-      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)\s*$/);
-      if (match) {
-        const key = match[1]!.trim();
-        let val = match[2]!.trim();
-        // Remove surrounding quotes if present
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-          val = val.substring(1, val.length - 1);
-        }
-        if (!process.env[key]) {
-          process.env[key] = val;
-        }
-      }
-    }
-  }
-}
-loadEnv();
-
-const PORT = process.env.PORT || "4321";
-const STREAM_KEY = process.env.RTMP_STREAM_KEY || "";
-const API_URL = process.env.BUNRADIO_API_URL || `http://localhost:${PORT}`;
-
-/**
- * Helper function to call the BunRadio HTTP REST API.
- */
-async function callApi(endpoint: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
-  const headers: Record<string, string> = {};
-
-  if (STREAM_KEY) {
-    headers["Authorization"] = `Bearer ${STREAM_KEY}`;
-  } else {
-    const ADMIN_USER = process.env.ADMIN_USER || "";
-    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
-    if (ADMIN_USER || ADMIN_PASSWORD) {
-      headers["Authorization"] = `Basic ${btoa(`${ADMIN_USER}:${ADMIN_PASSWORD}`)}`;
-    }
-  }
-
-  if (body) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  const url = `${API_URL}${endpoint}`;
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`API returned status ${response.status}: ${text || response.statusText}`);
-  }
-
-  return response.json();
-}
+import { state } from "./state";
+import { config } from "./config";
+import { actionSkipFallback, reshufflePlaylist, startFallback, stopFallback } from "./audio-router";
 
 // Create the MCP server
 const server = new McpServer({
@@ -72,27 +11,34 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-// Register MCP tools using the standard McpServer.tool(name, def) signature
-
 // 1. Get Status
 server.tool("get_status", {
   description: "Get the current status of the radio station, including broadcasting state, listener counts, and active track details",
   handler: async () => {
     try {
-      const status = await callApi("/status");
-      let currentTrack = null;
-      try {
-        const current = await callApi("/admin/api/current");
-        currentTrack = current.currentTrack;
-      } catch {
-        // Ignore auth failures if not configured or endpoints are disabled
-      }
+      const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
+      const status = {
+        broadcasting: state.isBroadcasting,
+        sourceConnected: state.sourceConnected,
+        listeners: state.clients.size,
+        maxListeners: config.maxListeners,
+        totalListenersServed: state.totalListenersServed,
+        totalBytesReceived: state.totalBytesReceived,
+        totalBytesSent: state.totalBytesSent,
+        uptimeSeconds,
+        stationName: "BunRadio",
+        detectedBitrateKbps: state.detectedBitrateKbps,
+        detectedSampleRate: state.detectedSampleRate,
+        fallbackBitrateKbps: config.fallbackBitrateKbps,
+        fallbackActive: !state.isBroadcasting && state.currentTrack !== null,
+        currentTrack: state.currentTrack,
+      };
       return {
-        content: [{ type: "text", text: JSON.stringify({ ...status, currentTrack }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
       };
     } catch (error: any) {
       return {
-        content: [{ type: "text", text: `Error connecting to BunRadio API: ${error.message}` }],
+        content: [{ type: "text", text: `Error: ${error.message}` }],
         isError: true,
       };
     }
@@ -104,9 +50,8 @@ server.tool("get_queue", {
   description: "Retrieve the current playback priority queue",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/queue");
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ queue: state.fallbackQueue }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -129,9 +74,10 @@ server.tool("push_to_queue", {
   },
   handler: async ({ file }: any) => {
     try {
-      const res = await callApi("/admin/api/queue/push", "POST", { file });
+      if (!file || typeof file !== "string") throw new Error("Parámetro 'file' inválido");
+      state.fallbackQueue.push(file);
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, queue: state.fallbackQueue }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -154,9 +100,11 @@ server.tool("remove_from_queue", {
   },
   handler: async ({ index }: any) => {
     try {
-      const res = await callApi("/admin/api/queue/remove", "POST", { index });
+      const idx = Number(index);
+      if (Number.isNaN(idx) || idx < 0 || idx >= state.fallbackQueue.length) throw new Error("Parámetro 'index' fuera de rango");
+      state.fallbackQueue.splice(idx, 1);
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, queue: state.fallbackQueue }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -172,9 +120,9 @@ server.tool("clear_queue", {
   description: "Clear all tracks from the priority queue",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/queue/clear", "POST");
+      state.fallbackQueue = [];
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, queue: [] }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -198,9 +146,15 @@ server.tool("move_in_queue", {
   },
   handler: async ({ from, to }: any) => {
     try {
-      const res = await callApi("/admin/api/queue/move", "POST", { from, to });
+      const f = Number(from);
+      const t = Number(to);
+      if (Number.isNaN(f) || f < 0 || f >= state.fallbackQueue.length || Number.isNaN(t) || t < 0 || t >= state.fallbackQueue.length) {
+        throw new Error("Valores 'from' o 'to' fuera de rango");
+      }
+      const [movedItem] = state.fallbackQueue.splice(f, 1);
+      if (movedItem) state.fallbackQueue.splice(t, 0, movedItem);
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, queue: state.fallbackQueue }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -216,10 +170,13 @@ server.tool("skip_track", {
   description: "Skip the current song. Note: Live RTMP streams cannot be skipped, only fallback tracks",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/skip", "POST");
-      return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
-      };
+      if (!state.isBroadcasting && state.currentTrack) {
+        actionSkipFallback();
+        return {
+          content: [{ type: "text", text: JSON.stringify({ success: true, message: "Saltando canción..." }, null, 2) }],
+        };
+      }
+      throw new Error("El vivo no se puede saltar, detén el stream desde OBS o no hay pista activa");
     } catch (error: any) {
       return {
         content: [{ type: "text", text: `Error: ${error.message}` }],
@@ -234,9 +191,9 @@ server.tool("shuffle_playlist", {
   description: "Reshuffle the fallback playlist and restart playback from the first track",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/playlist/shuffle", "POST");
+      reshufflePlaylist();
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -252,9 +209,18 @@ server.tool("list_files", {
   description: "List the available audio files in the local fallback directory configured on the server",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/files");
+      if (!config.fallbackSource) return { content: [{ type: "text", text: JSON.stringify({ files: [] }, null, 2) }] };
+      const stat = fs.statSync(config.fallbackSource);
+      let files: string[] = [];
+      if (stat.isDirectory()) {
+        files = fs.readdirSync(config.fallbackSource)
+          .filter((f) => /\.(mp3|flac|wav|m4a|aac|ogg)$/i.test(f))
+          .map((f) => `${config.fallbackSource}/${f}`);
+      } else {
+        files = [config.fallbackSource];
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ files }, null, 2) }],
       };
     } catch (error: any) {
       return {
@@ -270,9 +236,14 @@ server.tool("toggle_fallback", {
   description: "Toggle (pause or resume) fallback music playback when no live stream is active",
   handler: async () => {
     try {
-      const res = await callApi("/admin/api/fallback/toggle", "POST");
+      state.fallbackPaused = !state.fallbackPaused;
+      if (state.fallbackPaused) {
+        stopFallback();
+      } else {
+        startFallback();
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, paused: state.fallbackPaused }, null, 2) }],
       };
     } catch (error: any) {
       return {

@@ -37,7 +37,7 @@ bunradio/
 │   ├── dsp.ts              # Cadena de procesamiento de audio
 │   ├── lame-ffi.ts         # Encoder MP3 nativo via FFI
 │   ├── http-server.ts      # Servidor HTTP + API
-│   ├── http-helpers.ts     # Utilidades + Panel DJ embebido
+│   ├── http-helpers.ts     # Utilidades HTTP
 │   ├── mcp-server.ts       # Servidor MCP para IA
 │   └── logger.ts           # Sistema de logging
 ├── musica/                 # Carpeta de música fallback

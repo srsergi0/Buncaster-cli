@@ -10,8 +10,6 @@ export interface Config {
   maxListeners: number;
   preBufferBytes: number;
   corsOrigin: string;
-  adminUser?: string;
-  adminPassword?: string;
   logLevel: LogLevel;
   fallbackBitrateKbps: number;
   fallbackSource: string;
@@ -21,6 +19,9 @@ export interface Config {
   rtmpMinLiveSeconds: number;
   useNativeLame: "auto" | "true" | "false";
   streamFormat: StreamFormat;
+  // Moonshot tier opus: per-listener efficiency
+  opusTierEnabled: boolean;
+  opusTierBitrateKbps: number;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -69,8 +70,6 @@ function loadConfig(): Config {
     maxListeners: envInt("MAX_LISTENERS", 500),
     preBufferBytes: envInt("PREBUFFER_BYTES", 65536),
     corsOrigin: process.env.CORS_ORIGIN || "*",
-    adminUser: process.env.ADMIN_USER || undefined,
-    adminPassword: process.env.ADMIN_PASSWORD || undefined,
     logLevel: (process.env.LOG_LEVEL as LogLevel) || "info",
     fallbackBitrateKbps: envInt("STREAM_BITRATE_KBPS", 320),
     fallbackSource: process.env.FALLBACK_SOURCE || process.cwd(),
@@ -84,6 +83,8 @@ function loadConfig(): Config {
       return "auto";
     })(),
     streamFormat: validateFormat((process.env.STREAM_FORMAT as StreamFormat) || "mp3"),
+    opusTierEnabled: envBool("ENABLE_OPUS_TIER", true),
+    opusTierBitrateKbps: envInt("OPUS_TIER_BITRATE_KBPS", 32),
   };
 
   return cfg;

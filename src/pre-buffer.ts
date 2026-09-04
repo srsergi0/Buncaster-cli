@@ -27,3 +27,4 @@ export class PreBuffer {
 }
 
 export const preBuffer = new PreBuffer(config.preBufferBytes);
+export const preBufferOpus = new PreBuffer(config.preBufferBytes);
