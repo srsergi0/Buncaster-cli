@@ -8,7 +8,7 @@
 import { config } from "./config";
 import { sysLog, httpLog } from "./logger";
 import { state } from "./state";
-import { startFallback, stopFallback, stopMasterEncoder, stopPlaylistWatcher, runRtmpListener } from "./audio-router";
+import { startFallback, stopFallback, stopMasterEncoder, stopPlaylistWatcher, runSrtListener } from "./audio-router";
 import "./http-server"; // Levanta el servidor HTTP automáticamente al importar
 
 // =============================================================
@@ -25,11 +25,13 @@ console.log("");
 console.log("  ▸ STREAM (Escuchar):");
 console.log(`    http://localhost:${config.httpPort}/stream`);
 console.log("");
+console.log(`  ▸ STREAM Opus (eco 32k):`);
+console.log(`    http://localhost:${config.httpPort}/stream?format=opus`);
 console.log("");
-console.log("  ▸ ENVIAR DESDE OBS STUDIO:");
+console.log("  ▸ ENVIAR DESDE OBS STUDIO (SRT - sin plan B):");
 console.log("    Servicio:   Custom");
-console.log(`    Servidor:   rtmp://localhost:${config.rtmpPort}/live`);
-console.log(`    Stream Key: ${config.rtmpStreamKey}`);
+console.log(`    Servidor:   srt://localhost:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
+console.log(`    Stream Key: ${config.rtmpStreamKey} (en streamid)`);
 console.log("");
 if (config.fallbackSource) {
   console.log(`  ▸ MÚSICA: ${config.fallbackSource}`);
@@ -41,8 +43,8 @@ console.log("");
 // Arrancar audio de respaldo (fallback) inmediatamente
 startFallback();
 
-// Arrancar el receptor de OBS en segundo plano
-runRtmpListener();
+// Arrancar receptor SRT en segundo plano (sin RTMP, sin plan B)
+runSrtListener();
 
 // =============================================================
 // 2. APAGADO ORDENADO
@@ -69,7 +71,7 @@ function shutdown(signal: string): void {
   stopMasterEncoder();
 
   if (state.sourceProcess) {
-    sysLog.info("Deteniendo receptor RTMP...");
+    sysLog.info("Deteniendo receptor SRT...");
     try {
       state.sourceProcess.kill();
     } catch {

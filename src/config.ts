@@ -6,6 +6,7 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 export interface Config {
   httpPort: number;
   rtmpPort: number;
+  srtPort: number;
   host: string;
   maxListeners: number;
   preBufferBytes: number;
@@ -57,15 +58,17 @@ function loadConfig(): Config {
   const rtmpKey = process.env.RTMP_STREAM_KEY || generateStreamKey();
   const httpPort = envInt("PORT", 8080);
   const rtmpPort = envInt("RTMP_PORT", findFreePort(1935, [httpPort]));
+  const srtPort = envInt("SRT_PORT", findFreePort(1936, [httpPort, rtmpPort]));
   const host = process.env.HOST || "0.0.0.0";
 
-  if (httpPort === rtmpPort) {
-    throw new Error("PORT y RTMP_PORT no pueden ser el mismo puerto");
+  if (httpPort === rtmpPort || httpPort === srtPort || rtmpPort === srtPort) {
+    throw new Error("PORT, RTMP_PORT y SRT_PORT deben ser distintos");
   }
 
   const cfg: Config = {
     httpPort,
     rtmpPort,
+    srtPort,
     host,
     maxListeners: envInt("MAX_LISTENERS", 500),
     preBufferBytes: envInt("PREBUFFER_BYTES", 65536),

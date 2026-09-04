@@ -1151,3 +1151,122 @@ export async function runRtmpListener() {
     await new Promise((r) => setTimeout(r, 1000));
   }
 }
+
+// =============================================================
+// 6. BUCLE SRT (reemplazo RTMP sin plan B - UDP, 0-RTT, sin HOL)
+// =============================================================
+export async function runSrtListener() {
+  startMasterEncoder();
+
+  const flapWindowMs = 30000;
+  const flapMaxCount = 3;
+  const flapCooldownMs = 60000;
+  let disconnectTimestamps: number[] = [];
+  let srtCooldownUntil = 0;
+
+  while (true) {
+    if (state.shuttingDown) break;
+
+    if (Date.now() < srtCooldownUntil) {
+      rtmpLog.warn(`[SRT] En enfriamiento por flaps. Ignorando hasta ${new Date(srtCooldownUntil).toISOString()}`);
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+
+    rtmpLog.info(`Esperando SRT en srt://${config.host}:${config.srtPort}?streamid=live/${config.rtmpStreamKey} (mode listener)`);
+
+    const args = [
+      "-loglevel", "warning",
+      "-fflags", "nobuffer",
+      "-i", `srt://${config.host}:${config.srtPort}?mode=listener&transtype=live`,
+      "-vn",
+      "-f", "s16le",
+      "-ar", "48000",
+      "-ac", "2",
+      "-"
+    ];
+
+    try {
+      state.sourceProcess = Bun.spawn(["ffmpeg", ...args], {
+        stdout: "pipe",
+        stderr: "inherit",
+      });
+
+      state.sourceConnected = true;
+      const reader = state.sourceProcess.stdout.getReader();
+      const proc = state.sourceProcess;
+      proc.exited.then((code: number) => {
+        if (state.sourceProcess === proc) {
+          rtmpLog.info(`[SRT Listener] proceso SRT terminado (exit ${code}). Cancelando lector.`);
+          try { reader.cancel(); } catch {}
+        }
+      }).catch(()=>{});
+
+      let firstAudioAt = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value.byteLength > 0) {
+          state.totalBytesReceived += value.byteLength;
+          if (firstAudioAt === 0) firstAudioAt = Date.now();
+          const sustained = (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
+          if (!state.isBroadcasting && sustained) {
+            state.isBroadcasting = true;
+            liveTransitionStartTime = Date.now();
+            isLiveTransitionActive = config.crossfadeSeconds > 0;
+            rtmpLog.info(`¡SRT VIVO! (tras ${config.rtmpMinLiveSeconds}s sostenido)`);
+            state.currentTrack = null;
+          }
+        } else {
+          firstAudioAt = 0;
+        }
+        if (state.isBroadcasting) {
+          if (isLiveTransitionActive) {
+            const elapsed = Date.now() - liveTransitionStartTime;
+            const progress = Math.min(1.0, elapsed / (config.crossfadeSeconds * 1000));
+            const curDeck = activeDeck === "A" ? deckA : deckB;
+            const fbChunk = curDeck.buffer.pull(value.length);
+            const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
+            const volFb = Math.cos(progress * Math.PI * 0.5);
+            const mixed = mixSamples(value, volLive, fbChunk, volFb);
+            writeToMaster(mixed);
+            if (progress >= 1.0) {
+              isLiveTransitionActive = false;
+              stopFallback();
+            }
+          } else {
+            writeToMaster(value);
+          }
+        }
+      }
+    } catch (err) {
+      rtmpLog.error("Error SRT:", (err as Error).message);
+    } finally {
+      rtmpLog.info("Fuente SRT desconectada. Limpiando...");
+      state.isBroadcasting = false;
+      state.sourceConnected = false;
+      state.detectedBitrateKbps = null;
+      state.detectedSampleRate = null;
+      bitrateDetector.reset();
+      if (state.sourceProcess) {
+        try { state.sourceProcess.kill(); } catch {}
+        state.sourceProcess = null;
+      }
+      const now = Date.now();
+      disconnectTimestamps = disconnectTimestamps.filter(t => now - t < flapWindowMs);
+      disconnectTimestamps.push(now);
+      if (disconnectTimestamps.length > flapMaxCount) {
+        srtCooldownUntil = now + flapCooldownMs;
+        rtmpLog.warn(`[SRT] Demasiados flaps (${disconnectTimestamps.length}) enfriamiento ${flapCooldownMs/1000}s`);
+        disconnectTimestamps = [];
+      }
+      if (!state.shuttingDown) {
+        stopFallback();
+        isFallbackFadeInActive = config.crossfadeSeconds > 0;
+        fallbackFadeInStartTime = Date.now();
+        startFallback();
+      }
+    }
+    await new Promise(r=>setTimeout(r,1000));
+  }
+}
