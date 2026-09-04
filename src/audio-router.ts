@@ -1181,6 +1181,7 @@ export async function runRtmpListener() {
     } catch (err) {
       rtmpLog.debug("Error in RTMP FFmpeg process:", (err as Error).message);
     } finally {
+      const wasBroadcasting = state.isBroadcasting;
       rtmpLog.debug("RTMP source disconnected. Cleaning up...");
       state.isBroadcasting = false;
       state.sourceConnected = false;
@@ -1207,9 +1208,8 @@ export async function runRtmpListener() {
         disconnectTimestamps = [];
       }
 
-      if (!state.shuttingDown) {
-        stopFallback();
-        // Iniciar rampa de volumen de subida para el fallback - lowLatency usa 0.2s
+      if (!state.shuttingDown && wasBroadcasting) {
+        // Only resume fallback if we were live
         isFallbackFadeInActive = config.lowLatency ? config.crossfadeLiveSeconds > 0 : config.crossfadeSeconds > 0;
         fallbackFadeInStartTime = Date.now();
         startFallback();
@@ -1318,6 +1318,7 @@ export async function runSrtListener() {
     } catch (err) {
       rtmpLog.debug("Error SRT:", (err as Error).message);
     } finally {
+      const wasBroadcasting = state.isBroadcasting;
       rtmpLog.debug("SRT source disconnected. Cleaning up...");
       state.isBroadcasting = false;
       state.sourceConnected = false;
@@ -1336,8 +1337,8 @@ export async function runSrtListener() {
         rtmpLog.warn(`[SRT] Too many flaps (${disconnectTimestamps.length}) cooldown ${flapCooldownMs/1000}s`);
         disconnectTimestamps = [];
       }
-      if (!state.shuttingDown) {
-        stopFallback();
+      if (!state.shuttingDown && wasBroadcasting) {
+        // Only resume fallback if we were actually live — otherwise we were already on fallback, don't restart it
         isFallbackFadeInActive = config.lowLatency ? config.crossfadeLiveSeconds > 0 : config.crossfadeSeconds > 0;
         fallbackFadeInStartTime = Date.now();
         startFallback();
