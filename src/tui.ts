@@ -148,17 +148,9 @@ export async function startTui(): Promise<void> {
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.cyan }, label: { fg: NEON.cyan, bold: true } },
     padding: { left: 1, right: 1 },
   });
-  const vuBg = blessed.box({
-    parent: nowBox, top: 8, left: 1, width: "98%", height: 1,
-    style: { bg: "#0f1419" },
-  });
-  const vuBar = blessed.box({
-    parent: vuBg, top: 0, left: 0, width: "0%", height: 1,
-    style: { bg: NEON.green },
-  });
   const prog = blessed.progressbar({
     parent: nowBox,
-    top: 10, left: 1, width: "98%", height: 1,
+    top: 8, left: 1, width: "98%", height: 1,
     orientation: "horizontal",
     filled: 0,
     pch: "█",
@@ -379,10 +371,7 @@ export async function startTui(): Promise<void> {
       `  {bold}{${NEON.cyan}-fg}◉  B U N R A D I O{/}  {grey-fg}·{/}  Ultra-Low-Latency Internet Radio  {grey-fg}·{/}  v1.0.0  {grey-fg}│{/}  ${liveLabel}  {grey-fg}│{/}  {bold}${state.clients.size}{/} listeners  {grey-fg}(${mp3N} mp3 · ${opusN} opus){/}  {grey-fg}│{/}  ${now}  {grey-fg}│{/}  {bold}Q{/}uit`
     );
 
-    // Now Playing — progress + VU
-    const vuW = 6 + Math.floor(Math.random() * 18) + (state.isBroadcasting ? 30 : 0) + (pct % 10);
-    (vuBar as any).width = `${Math.min(100, vuW)}%`;
-    (vuBar as any).style.bg = state.isBroadcasting ? NEON.red : state.currentTrack ? NEON.green : NEON.yellow;
+    // Now Playing — progress
     (prog as any).setProgress(pct);
     nowBox.setContent(
       `{bold}{white-fg}${dot}  NOW PLAYING{/}\n` +
@@ -392,7 +381,6 @@ export async function startTui(): Promise<void> {
       `\n` +
       ` {grey-fg}${fmtTime(elap)}  —  ${fmtTime(dur)}   {cyan-fg}${pct.toFixed(0)}%{/}\n`
     );
-    // VU is a separate box, keep it
 
     // Streams
     streamBox.setContent(
