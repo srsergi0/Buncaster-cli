@@ -98,6 +98,8 @@ try {
       "max-listeners": { type: "string" },
       yes: { type: "boolean", short: "y" },
       interactive: { type: "boolean" },
+      tui: { type: "boolean" },
+      "no-tui": { type: "boolean" },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
     },
@@ -284,17 +286,26 @@ if (shouldWizard) {
   if (values["max-listeners"] !== undefined) setEnv("MAX_LISTENERS", String(values["max-listeners"]));
 }
 
-// If neither wizard nor flags and non-TTY, we just keep env as is (zero-config)
-// Nice log for bundler context
-if (process.env.BUNRADIO_CLI !== "0") {
-  // avoid noise when imported as lib
-}
-
 // ---------- launch server (dynamic import after env is set) ----------
 // This must be dynamic so src/config.ts reads the updated process.env
 // and src/http-server.ts binds to the correct ports.
+// Common user: launch TUI console app with mouse buttons instead of plain logs.
+
+const useTui = (() => {
+  if (has("--no-tui") || values["no-tui"]) return false;
+  if (has("--tui") || values["tui"]) return true;
+  // Default: interactive TTY -> TUI, non-TTY/Docker/--yes -> plain logs
+  return shouldWizard || (isTTY && !values.yes);
+})();
 
 try {
+  if (useTui) {
+    process.env.BUNRADIO_TUI = "1";
+    const { startTui } = await import("./tui.ts");
+    startTui();
+    // small delay so TUI renders before radio logs start flowing into it
+    await new Promise(r => setTimeout(r, 100));
+  }
   await import("./index-rtmp.ts");
 } catch (err) {
   console.error("\n  ✖ Failed to start radio:", err);

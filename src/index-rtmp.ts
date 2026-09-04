@@ -15,31 +15,33 @@ import "./http-server"; // Levanta el servidor HTTP automáticamente al importar
 // 1. INICIALIZACIÓN DE FUENTES
 // =============================================================
 
-// Imprimir instrucciones de conexión en la consola
-console.log("");
-console.log("  ╔══════════════════════════════════════════════════╗");
-console.log("  ║           🎙️  B U N R A D I O                  ║");
-console.log("  ║          Your radio is ready.                   ║");
-console.log("  ╚══════════════════════════════════════════════════╝");
-console.log("");
-console.log("  ▸ STREAM (Listen):");
-console.log(`    http://localhost:${config.httpPort}/mp3`);
-console.log("");
-console.log(`  ▸ STREAM Opus (eco 96k):`);
-console.log(`    http://localhost:${config.httpPort}/opus`);
-console.log("");
-console.log("  ▸ SEND FROM OBS STUDIO (SRT - no plan B):");
-console.log("    Service:   Custom");
-console.log(`    Server:   srt://localhost:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
-console.log(`    Stream Key: ${config.rtmpStreamKey} (in streamid)`);
-console.log("");
-if (config.fallbackSource) {
-  console.log(`  ▸ MUSIC: ${config.fallbackSource}`);
-  if (config.fallbackSource.trim() === "") console.log("    (live-only mode: silence until live)");
-} else {
-  console.log("  ▸ MUSIC: Not configured (FALLBACK_SOURCE=\"\" => live-only, silence until live)");
+// Imprimir instrucciones en consola solo si no hay TUI (TUI tiene su propio header)
+if (process.env.BUNRADIO_TUI !== "1") {
+  console.log("");
+  console.log("  ╔══════════════════════════════════════════════════╗");
+  console.log("  ║           🎙️  B U N R A D I O                  ║");
+  console.log("  ║          Your radio is ready.                   ║");
+  console.log("  ╚══════════════════════════════════════════════════╝");
+  console.log("");
+  console.log("  ▸ STREAM (Listen):");
+  console.log(`    http://localhost:${config.httpPort}/mp3`);
+  console.log("");
+  console.log(`  ▸ STREAM Opus (eco 96k):`);
+  console.log(`    http://localhost:${config.httpPort}/opus`);
+  console.log("");
+  console.log("  ▸ SEND FROM OBS STUDIO (SRT - no plan B):");
+  console.log("    Service:   Custom");
+  console.log(`    Server:   srt://localhost:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
+  console.log(`    Stream Key: ${config.rtmpStreamKey} (in streamid)`);
+  console.log("");
+  if (config.fallbackSource) {
+    console.log(`  ▸ MUSIC: ${config.fallbackSource}`);
+    if (config.fallbackSource.trim() === "") console.log("    (live-only mode: silence until live)");
+  } else {
+    console.log("  ▸ MUSIC: Not configured (FALLBACK_SOURCE=\"\" => live-only, silence until live)");
+  }
+  console.log("");
 }
-console.log("");
 
 // Arrancar audio de respaldo (fallback) inmediatamente
 startFallback();

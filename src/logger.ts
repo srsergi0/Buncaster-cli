@@ -18,25 +18,26 @@ function appendFileLog(scope: string, level: string, args: unknown[]) {
 
 function makeLogger(scope: string) {
   const enabled = (level: LogLevel) => LOG_LEVELS[level] >= LOG_LEVELS[config.logLevel];
+  const isTui = () => process.env.BUNRADIO_TUI === "1";
   return {
     debug: (...args: unknown[]) => {
       if (!enabled("debug")) return;
-      console.debug(`DEBUG [${scope}]`, ...args);
+      if (!isTui()) console.debug(`DEBUG [${scope}]`, ...args);
       appendFileLog(scope, "DEBUG", args);
     },
     info: (...args: unknown[]) => {
       if (!enabled("info")) return;
-      console.log(`INFO  [${scope}]`, ...args);
+      if (!isTui()) console.log(`INFO  [${scope}]`, ...args);
       appendFileLog(scope, "INFO", args);
     },
     warn: (...args: unknown[]) => {
       if (!enabled("warn")) return;
-      console.warn(`WARN  [${scope}]`, ...args);
+      if (!isTui()) console.warn(`WARN  [${scope}]`, ...args);
       appendFileLog(scope, "WARN", args);
     },
     error: (...args: unknown[]) => {
       if (!enabled("error")) return;
-      console.error(`ERROR [${scope}]`, ...args);
+      if (!isTui()) console.error(`ERROR [${scope}]`, ...args);
       appendFileLog(scope, "ERROR", args);
     },
   };

@@ -19,12 +19,14 @@
     "mcp": "bun run src/mcp-server.ts"
   },
   "devDependencies": {
+    "@types/blessed": "^0.1.27",
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
+    "blessed": "^0.1.81",
     "inquirer": "^14.2.1",
     "mcp-lite": "^0.10.0",
     "zod": "^4.4.3"
