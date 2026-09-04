@@ -19,15 +19,17 @@
     "mcp": "bun run src/mcp-server.ts"
   },
   "devDependencies": {
-    "@types/blessed": "^0.1.27",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "blessed": "^0.1.81",
     "mcp-lite": "^0.10.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "zod": "^4.4.3"
   }
 }

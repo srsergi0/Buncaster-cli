@@ -145,6 +145,69 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
     return new Response(stream, { headers: streamHeaders });
   }
 
+  // ---- Web UI (TSX — Bun compiles) ----
+  if (path === "/" || path === "/index.html") {
+    try {
+      const html = await Bun.file("public/index.html").text();
+      return new Response(html, { headers: { "Content-Type": "text/html", ...corsHeaders() } });
+    } catch {
+      return new Response("<h1>BUNRADIO</h1><p>Web UI not built — run <code>bun run build</code></p><p><a href='/mp3'>/mp3</a> <a href='/opus'>/opus</a></p>", { headers: { "Content-Type": "text/html", ...corsHeaders() } });
+    }
+  }
+  if (path === "/app.js") {
+    try {
+      // Bun natively compiles TSX — build on the fly (cached)
+      const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
+      if (!build.success || !build.outputs[0]) throw new Error("Build failed");
+      const js = await build.outputs[0].text();
+      return new Response(js, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
+    } catch (e: any) {
+      return new Response(`console.error("Web build failed: ${String(e.message).replace(/"/g, "'")}");`, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
+    }
+  }
+
+  // ---- Web API — control from TSX (no auth for local, uses same as MCP later) ----
+  if (path === "/api/fallback" && req.method === "POST") {
+    try {
+      const { folder } = await req.json() as any;
+      const { setFallbackSource } = await import("./audio-router");
+      const f = String(folder ?? "").trim();
+      setFallbackSource(f);
+      return Response.json({ ok: true, message: f === "" ? "Live-only" : `Folder set to ${f}` }, { headers: corsHeaders() });
+    } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
+  }
+  if (path === "/api/queue/add" && req.method === "POST") {
+    try {
+      const { file } = await req.json() as any;
+      const f = String(file ?? "").trim();
+      if (!f) throw new Error("file required");
+      const { state: st } = await import("./state");
+      const { startFallback } = await import("./audio-router");
+      // @ts-ignore
+      st.fallbackQueue = (st as any).fallbackQueue || [];
+      // @ts-ignore
+      (st as any).fallbackQueue.push(f);
+      try { startFallback(); } catch {}
+      return Response.json({ ok: true, message: `Added ${f.split("/").pop()}` }, { headers: corsHeaders() });
+    } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
+  }
+  if (path === "/api/skip" && req.method === "POST") {
+    try {
+      const { stopFallback, startFallback } = await import("./audio-router");
+      // @ts-ignore
+      const { state: st } = await import("./state");
+      // force skip: stop current and start next
+      try { stopFallback(); } catch {}
+      // reshuffle index
+      setTimeout(() => { try { startFallback(); } catch {} }, 100);
+      return Response.json({ ok: true, message: "Skipped" }, { headers: corsHeaders() });
+    } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
+  }
+  if (path === "/api/stop" && req.method === "POST") {
+    setTimeout(() => process.exit(0), 200);
+    return Response.json({ ok: true, message: "Stopping..." }, { headers: corsHeaders() });
+  }
+
   // ---- Health/Status/Metrics ----
   if (path === "/health") {
     const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
