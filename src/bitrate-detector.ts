@@ -94,5 +94,5 @@ export class BitrateDetector {
   }
 }
 export const bitrateDetector = new BitrateDetector((info) => {
-  rtmpLog.info(`Detected real bitrate: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`);
+  rtmpLog.debug(`Detected real bitrate: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`);
 });

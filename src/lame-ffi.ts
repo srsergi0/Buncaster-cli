@@ -69,7 +69,7 @@ export function isNativeLameAvailable(): boolean {
         lame_close: { args: ["ptr"], returns: "i32" },
       });
       symbols = lib.symbols as unknown as LameSymbols;
-      rtmpLog.info(`[LAME-FFI] libmp3lame loaded from ${path}`);
+      rtmpLog.debug(`[LAME-FFI] libmp3lame loaded from ${path}`);
       return true;
     } catch {
       // intentar siguiente ruta

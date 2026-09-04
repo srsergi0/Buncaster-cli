@@ -179,7 +179,7 @@ function loadMetaCache() {
           metaCache.set(k, v as any);
         }
       }
-      rtmpLog.info(`[Meta Cache] Loaded ${metaCache.size} metadata cached from ${META_CACHE_FILE}.`);
+      rtmpLog.debug(`[Meta Cache] Loaded ${metaCache.size} metadata cached from ${META_CACHE_FILE}.`);
     }
   } catch {
     // No existe o inválido - empezar vacío
@@ -291,7 +291,7 @@ function writeToMaster(chunk: Uint8Array) {
 export function reshufflePlaylist() {
   shuffle(fallbackPlaylist);
   currentPlaylistIndex = 0;
-  rtmpLog.info("[Fallback Playlist] Playlist reshuffled on API request.");
+  rtmpLog.debug("[Fallback Playlist] Playlist reshuffled on API request.");
   if ((deckA.process || deckB.process) && !state.isBroadcasting) {
     stopFallback();
   }
@@ -353,7 +353,7 @@ async function getFileMetadata(file: string) {
 
     return meta;
   } catch (err) {
-    rtmpLog.error("Error reading metadata with ffprobe:", (err as Error).message);
+    rtmpLog.debug("Error reading metadata with ffprobe:", (err as Error).message);
     return { title: "", artist: "", duration: 0 };
   }
 }
@@ -386,7 +386,7 @@ function initializeFallbackSource() {
       const audioFiles = getAudioFilesRecursive(config.fallbackSource);
 
       if (audioFiles.length === 0) {
-        rtmpLog.warn(`Fallback folder "${config.fallbackSource}" contains no valid audio files.`);
+        rtmpLog.info(`🔇 No music files in "${config.fallbackSource}" — playing silence until you go live.`);
         fallbackPlaylist = [];
         return;
       }
@@ -395,15 +395,16 @@ function initializeFallbackSource() {
       shuffle(fallbackPlaylist);
       currentPlaylistIndex = 0;
       isPlaylistInitialized = true;
-      rtmpLog.info(`Initialized fallback folder with ${audioFiles.length} songs recursively and shuffled.`);
+      rtmpLog.info(`🎵 Found ${audioFiles.length} songs in "${config.fallbackSource}"`);
     } else {
       fallbackPlaylist = [config.fallbackSource];
       currentPlaylistIndex = 0;
       isPlaylistInitialized = true;
-      rtmpLog.info(`Initialized single fallback file: ${config.fallbackSource}`);
+      rtmpLog.info(`🎵 Found 1 song: ${config.fallbackSource}`);
     }
   } catch (err) {
-    rtmpLog.error(`Error accessing FALLBACK_SOURCE "${config.fallbackSource}":`, (err as Error).message);
+    rtmpLog.info(`🔇 Music folder "${config.fallbackSource}" not found — playing silence until you go live.`);
+    rtmpLog.debug(`FALLBACK_SOURCE stat failed: ${(err as Error).message}`);
     fallbackPlaylist = [];
   }
 }
@@ -479,10 +480,10 @@ function rescanPlaylist() {
 
     // Loggear cambios
     for (const f of added) {
-      rtmpLog.info(`[Playlist Watch] + Song added: ${f.split("/").pop()}`);
+      rtmpLog.debug(`[Playlist Watch] + Song added: ${f.split("/").pop()}`);
     }
     for (const f of removed) {
-      rtmpLog.info(`[Playlist Watch] - Song removed: ${f.split("/").pop()}`);
+      rtmpLog.debug(`[Playlist Watch] - Song removed: ${f.split("/").pop()}`);
     }
 
     // Determinar la canción que está sonando ahora mismo para preservar posición
@@ -510,11 +511,11 @@ function rescanPlaylist() {
       }
     }
 
-    rtmpLog.info(
+    rtmpLog.debug(
       `[Playlist Watch] Playlist rebuilt: ${removed.length} removed, ${added.length} added. Total: ${fallbackPlaylist.length} tracks.`,
     );
   } catch (err) {
-    rtmpLog.error("[Playlist Watch] Error rescanning folder:", (err as Error).message);
+    rtmpLog.debug(`[Playlist Watch] Error rescanning folder: ${(err as Error).message}`);
   }
 }
 
@@ -546,16 +547,16 @@ function startPlaylistWatcher() {
           rescanDebounceTimer = null;
         }, RESCAN_DEBOUNCE_MS);
       });
-      rtmpLog.info(`[Playlist Watch] fs.watch() active on: ${config.fallbackSource}`);
+      rtmpLog.debug(`[Playlist Watch] fs.watch() active on: ${config.fallbackSource}`);
     } catch {
-      rtmpLog.warn("[Playlist Watch] fs.watch() not available, using polling only.");
+      rtmpLog.debug("[Playlist Watch] fs.watch() not available, using polling only.");
     }
 
     // 2. Polling — safety net cada 5s (necesario en Docker/Windows)
     pollingTimer = setInterval(pollForChanges, POLL_INTERVAL_MS);
-    rtmpLog.info(`[Playlist Watch] Polling active every ${POLL_INTERVAL_MS / 1000}s.`);
+    rtmpLog.debug(`[Playlist Watch] Polling active every ${POLL_INTERVAL_MS / 1000}s.`);
   } catch (err) {
-    rtmpLog.warn(`[Playlist Watch] Could not watch folder: ${(err as Error).message}`);
+    rtmpLog.debug(`[Playlist Watch] Could not watch folder: ${(err as Error).message}`);
   }
 }
 
@@ -575,7 +576,7 @@ export function stopPlaylistWatcher() {
     playlistWatcher.close();
     playlistWatcher = null;
   }
-  rtmpLog.info("[Playlist Watch] Watcher and polling stopped.");
+  rtmpLog.debug("[Playlist Watch] Watcher and polling stopped.");
 }
 
 export function startMasterEncoder() {
@@ -594,7 +595,7 @@ export function startMasterEncoder() {
         2, // quality 2 = buena calidad (0=mejor, 9=más rápido)
       );
       nativeEncoder = { encoder };
-      rtmpLog.info(
+      rtmpLog.debug(
         `[Master Encoder] Native mode active (LAME-FFI) at ${config.fallbackBitrateKbps}kbps. No ffmpeg process.`,
       );
       if (config.opusTierEnabled) startOpusEncoder();
@@ -614,7 +615,7 @@ export function startMasterEncoder() {
 
 function startFfmpegMasterEncoder() {
   const fmt = FORMAT_CONFIG[config.streamFormat];
-  rtmpLog.info(`Starting FFmpeg Master Encoder [${config.streamFormat.toUpperCase()}] a ${config.fallbackBitrateKbps}kbps...`);
+  rtmpLog.debug(`Starting FFmpeg Master Encoder [${config.streamFormat.toUpperCase()}] at ${config.fallbackBitrateKbps}kbps...`);
 
   const args = [
     "-loglevel", "warning",
@@ -637,7 +638,7 @@ function startFfmpegMasterEncoder() {
     state.masterProcess = Bun.spawn(["ffmpeg", ...args], {
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "inherit",
+      stderr: "pipe",
     });
 
     const reader = state.masterProcess.stdout.getReader();
@@ -645,7 +646,7 @@ function startFfmpegMasterEncoder() {
     const processInstance = state.masterProcess;
     processInstance.exited.then((exitCode: number) => {
       if (state.masterProcess === processInstance) {
-        rtmpLog.warn(`[Master Encoder] Master Encoder process ended (exitCode: ${exitCode}). Limpiando.`);
+        rtmpLog.debug(`[Master Encoder] ended (exit ${exitCode})`);
         try {
           reader.cancel();
         } catch {
@@ -657,7 +658,7 @@ function startFfmpegMasterEncoder() {
 
     pipeMaster(reader);
   } catch (err) {
-    rtmpLog.error("Error starting FFmpeg Master Encoder:", (err as Error).message);
+    rtmpLog.debug(`Master Encoder start failed: ${(err as Error).message}`);
   }
 }
 
@@ -666,7 +667,7 @@ async function pipeMaster(reader: ReadableStreamDefaultReader<Uint8Array>) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        rtmpLog.info("Master Encoder output stream closed.");
+        rtmpLog.debug("Master Encoder output stream closed.");
         break;
       }
       bitrateDetector.feed(value);
@@ -674,7 +675,7 @@ async function pipeMaster(reader: ReadableStreamDefaultReader<Uint8Array>) {
     }
   } catch (err) {
     if (!state.shuttingDown) {
-      rtmpLog.error("Error reading Master Encoder output:", (err as Error).message);
+      rtmpLog.debug("Error reading Master Encoder output:", (err as Error).message);
     }
   }
 }
@@ -685,7 +686,7 @@ export function startOpusEncoder() {
   if (!config.opusTierEnabled) return;
   // Verificar codec disponible
   const opusFmt = FORMAT_CONFIG["opus"];
-  rtmpLog.info(`Starting Opus Tier Encoder [OPUS] at ${config.opusTierBitrateKbps}kbps ...`);
+  rtmpLog.debug(`Starting Opus Tier Encoder [OPUS] at ${config.opusTierBitrateKbps}kbps ...`);
   rtmpLog.debug(`[Opus Debug] source pcm 48k s16le stereo -> libopus ${config.opusTierBitrateKbps}k, audioProcessing=${config.audioProcessing}, fallbackBitrate=${config.fallbackBitrateKbps}k`);
   const args = [
     "-loglevel", "warning",
@@ -707,20 +708,20 @@ export function startOpusEncoder() {
     state.opusProcess = Bun.spawn(["ffmpeg", ...args], {
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "inherit",
+      stderr: "pipe",
     });
     const reader = state.opusProcess.stdout.getReader();
     const proc = state.opusProcess;
     proc.exited.then((code: number) => {
       if (state.opusProcess === proc) {
-        rtmpLog.warn(`[Opus Tier] process ended (exit ${code})`);
+        rtmpLog.debug(`[Opus Tier] process ended (exit ${code})`);
         try { reader.cancel(); } catch {}
         state.opusProcess = null;
       }
     }).catch(()=>{});
     pipeOpus(reader);
   } catch (err) {
-    rtmpLog.error("Error starting Opus Tier:", (err as Error).message);
+    rtmpLog.debug("Error starting Opus Tier:", (err as Error).message);
   }
 }
 
@@ -731,7 +732,7 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        rtmpLog.info("Opus stream closed");
+        rtmpLog.debug("Opus stream closed");
         break;
       }
       // Captura headers OpusHead/OpusTags (primer chunk contiene OggS + OpusHead)
@@ -740,13 +741,13 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
         if (text.includes("OpusHead")) {
           // Guarda todo el primer chunk como headers (contiene ambas cabeceras)
           opusHeaders = value.slice();
-          rtmpLog.info(`[Opus Tier] headers captured ${opusHeaders.length}B`);
+          rtmpLog.debug(`[Opus Tier] headers captured ${opusHeaders.length}B`);
           rtmpLog.debug(`[Opus Debug] headers hex ${Array.from(value.subarray(0,32)).map(b=>b.toString(16).padStart(2,"0")).join(" ")}`);
         } else if (value.length < 8192) {
           // Primer chunk pequeño sin OpusHead aún, acumular? Por ahora guarda primer chunk
           // No debería pasar, pero por seguridad guarda primer chunk
           opusHeaders = value.slice();
-          rtmpLog.info(`[Opus Tier] headers (fallback) capturados ${opusHeaders.length}B`);
+          rtmpLog.debug(`[Opus Tier] headers (fallback) ${opusHeaders.length}B`);
         }
       }
       opusPackets++;
@@ -757,13 +758,13 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
       broadcastOpus(value);
     }
   } catch (err) {
-    if (!state.shuttingDown) rtmpLog.error("Error reading Opus:", (err as Error).message);
+    if (!state.shuttingDown) rtmpLog.debug(`Error reading Opus: ${(err as Error).message}`);
   }
 }
 
 export function stopOpusEncoder() {
   if (!state.opusProcess) return;
-  rtmpLog.info("Stopping Opus Tier...");
+  rtmpLog.debug("Stopping Opus Tier...");
   try {
     state.opusProcess.stdin.end();
     state.opusProcess.kill();
@@ -777,7 +778,7 @@ export function stopMasterEncoder() {
 
   // --- Modo nativo ---
   if (nativeEncoder) {
-    rtmpLog.info("Stopping Native Master Encoder...");
+    rtmpLog.debug("Stopping Native Master Encoder...");
     const flushed = nativeEncoder.encoder.flush();
     if (flushed.length > 0) {
       bitrateDetector.feed(flushed);
@@ -790,7 +791,7 @@ export function stopMasterEncoder() {
 
   // --- Modo ffmpeg ---
   if (!state.masterProcess) return;
-  rtmpLog.info("Stopping FFmpeg Master Encoder...");
+  rtmpLog.debug("Stopping FFmpeg Master Encoder...");
   try {
     state.masterProcess.stdin.end();
     state.masterProcess.kill();
@@ -806,7 +807,7 @@ function startSilence() {
   if (silenceInterval) return;
   if (state.isBroadcasting) return;
   startMasterEncoder();
-  rtmpLog.info("No fallback configured — generating silence (live-only mode)");
+  rtmpLog.debug("Silence generator started (live-only)");
   const silenceChunk = new Uint8Array(4800 * 4); // 100ms s16le stereo 48k
   silenceInterval = setInterval(() => {
     if (state.isBroadcasting || state.shuttingDown) {
@@ -822,8 +823,9 @@ export function stopSilence() {
 }
 
 export function startFallback() {
-  // Modo sin fallback: genera silencio hasta que llegue vivo
+  // No fallback: live-only silence
   if (!config.fallbackSource || config.fallbackSource.trim() === "") {
+    rtmpLog.info("🔇 No music — playing silence until you go live");
     startSilence();
     return;
   }
@@ -852,21 +854,22 @@ export function startFallback() {
     fileToPlay = state.fallbackQueue.shift()!;
   } else {
     if (fallbackPlaylist.length === 0) {
-      rtmpLog.info("Fallback playlist empty — generating silence (live-only mode)");
+      // already logged friendly message in initializeFallbackSource / startSilence
+      rtmpLog.debug("Fallback playlist empty — silence");
       startSilence();
       return;
     }
     fileToPlay = fallbackPlaylist[currentPlaylistIndex]!;
     currentPlaylistIndex++;
     if (currentPlaylistIndex >= fallbackPlaylist.length) {
-      rtmpLog.info("[Fallback Playlist] End of list. Reshuffling...");
+      rtmpLog.debug("[Fallback Playlist] End of list. Reshuffling...");
       shuffle(fallbackPlaylist);
       currentPlaylistIndex = 0;
     }
   }
 
   const cleanName = fileToPlay.split("/").pop() || "Desconocido";
-  rtmpLog.info(`[Deck ${currentDeck.id}] Loading track: ${cleanName}`);
+  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track: ${cleanName}`);
 
   currentDeck.currentTrackFile = fileToPlay;
 
@@ -895,13 +898,13 @@ export function startFallback() {
   try {
     currentDeck.process = Bun.spawn(["ffmpeg", ...args], {
       stdout: "pipe",
-      stderr: "inherit",
+      stderr: "pipe",
     });
 
     const reader = currentDeck.process.stdout.getReader();
     pipeFallback(currentDeck, reader);
   } catch (err) {
-    rtmpLog.error(`Error starting FFmpeg on Deck ${currentDeck.id}:`, (err as Error).message);
+    rtmpLog.debug(`Error starting FFmpeg on Deck ${currentDeck.id}: ${(err as Error).message}`);
   }
 }
 
@@ -913,7 +916,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
   if (processInstance) {
     processInstance.exited.then((exitCode: number) => {
       if (deck.process === processInstance && !transitionStarted) {
-        rtmpLog.info(`[Deck ${deck.id}] Process ended (exitCode: ${exitCode}). Cancelando lector.`);
+        rtmpLog.debug(`[Deck ${deck.id}] Process ended (exitCode: ${exitCode}).`);
         try {
           reader.cancel();
         } catch {
@@ -992,7 +995,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
             if (remaining <= config.crossfadeSeconds && !transitionStarted) {
               transitionStarted = true;
               crossfadeStartTime = Date.now();
-              rtmpLog.info(`[Crossfade] Track ending. Crossfading from Deck ${deck.id}.`);
+              rtmpLog.debug(`[Crossfade] Track ending. Crossfading from Deck ${deck.id}.`);
               
               // Iniciar el siguiente en el deck inactivo
               startFallback();
@@ -1003,7 +1006,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
     }
   } catch (err) {
     if (!isStoppingFallback) {
-      rtmpLog.error(`Error reading Deck stream ${deck.id}:`, (err as Error).message);
+      rtmpLog.debug(`Error reading Deck stream ${deck.id}: ${(err as Error).message}`);
     }
   } finally {
     const wasIntentionallyStopped = deck.process === null;
@@ -1018,7 +1021,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
         startFallback();
       } else if (activeDeck === deck.id && transitionStarted) {
         // FIX: Deck terminó durante un crossfade — completar la transición
-        rtmpLog.info(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
+        rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
         transitionStarted = false;
         activeDeck = deck.id === "A" ? "B" : "A";
         const newDeck = activeDeck === "A" ? deckA : deckB;
@@ -1050,7 +1053,7 @@ export function stopFallback() {
 }
 
 export function actionSkipFallback() {
-  rtmpLog.info("[API] Skip request received.");
+  rtmpLog.debug("[API] Skip request received.");
   stopFallback();
   transitionStarted = false;
   isFallbackFadeInActive = false;
@@ -1087,7 +1090,7 @@ export async function runRtmpListener() {
       continue;
     }
 
-    rtmpLog.info(`Waiting for RTMP connection from OBS on rtmp://${config.host}:${config.rtmpPort}/live/${config.rtmpStreamKey}`);
+    rtmpLog.debug(`Waiting for RTMP connection from OBS on rtmp://${config.host}:${config.rtmpPort}/live/${config.rtmpStreamKey}`);
 
     const args = [
       "-loglevel", "warning",
@@ -1104,7 +1107,7 @@ export async function runRtmpListener() {
     try {
       state.sourceProcess = Bun.spawn(["ffmpeg", ...args], {
         stdout: "pipe",
-        stderr: "inherit",
+        stderr: "pipe",
       });
 
       state.sourceConnected = true;
@@ -1113,7 +1116,7 @@ export async function runRtmpListener() {
       const processInstance = state.sourceProcess;
       processInstance.exited.then((exitCode: number) => {
         if (state.sourceProcess === processInstance) {
-          rtmpLog.info(`[RTMP Listener] RTMP receiver process ended (exitCode: ${exitCode}). Cancelando lector.`);
+          rtmpLog.debug(`[RTMP] process ended (exit ${exitCode})`);
           try {
             reader.cancel();
           } catch {
@@ -1174,9 +1177,9 @@ export async function runRtmpListener() {
         }
       }
     } catch (err) {
-      rtmpLog.error("Error in RTMP FFmpeg process:", (err as Error).message);
+      rtmpLog.debug("Error in RTMP FFmpeg process:", (err as Error).message);
     } finally {
-      rtmpLog.info("RTMP source disconnected. Cleaning up...");
+      rtmpLog.debug("RTMP source disconnected. Cleaning up...");
       state.isBroadcasting = false;
       state.sourceConnected = false;
       state.detectedBitrateKbps = null;
@@ -1236,7 +1239,8 @@ export async function runSrtListener() {
       continue;
     }
 
-    rtmpLog.info(`Waiting for SRT on srt://${config.host}:${config.srtPort}?streamid=live/${config.rtmpStreamKey} (mode listener)`);
+    rtmpLog.info(`🎧 Ready — waiting for you to go live from OBS (SRT port ${config.srtPort})`);
+    rtmpLog.debug(`SRT listener srt://${config.host}:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
 
     const args = [
       "-loglevel", "warning",
@@ -1252,7 +1256,7 @@ export async function runSrtListener() {
     try {
       state.sourceProcess = Bun.spawn(["ffmpeg", ...args], {
         stdout: "pipe",
-        stderr: "inherit",
+        stderr: "pipe",
       });
 
       state.sourceConnected = true;
@@ -1260,12 +1264,12 @@ export async function runSrtListener() {
       const proc = state.sourceProcess;
       proc.exited.then((code: number) => {
         if (state.sourceProcess === proc) {
-          rtmpLog.info(`[SRT Listener] SRT process ended (exit ${code}). Cancelando lector.`);
+          rtmpLog.debug(`[SRT] process ended (exit ${code})`);
           try { reader.cancel(); } catch {}
         }
       }).catch(()=>{});
 
-      rtmpLog.info(`[SRT] connected, waiting for first audio...`);
+      rtmpLog.debug(`[SRT] connected, waiting for audio`);
 
       let firstAudioAt = 0;
       while (true) {
@@ -1275,7 +1279,7 @@ export async function runSrtListener() {
           state.totalBytesReceived += value.byteLength;
           if (firstAudioAt === 0) {
             firstAudioAt = Date.now();
-            rtmpLog.info(`[SRT] first audio ${value.byteLength}B received`);
+            rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
           }
           const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
           if (!state.isBroadcasting && sustained) {
@@ -1283,7 +1287,7 @@ export async function runSrtListener() {
             stopSilence();
             liveTransitionStartTime = Date.now();
             isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const liveMsg = config.lowLatency ? "SRT LIVE! (low-latency instant)" : `SRT LIVE! (after ${config.rtmpMinLiveSeconds}s sustained)`;
+            const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
             rtmpLog.info(liveMsg);
             state.currentTrack = null;
           }
@@ -1310,9 +1314,9 @@ export async function runSrtListener() {
         }
       }
     } catch (err) {
-      rtmpLog.error("Error SRT:", (err as Error).message);
+      rtmpLog.debug("Error SRT:", (err as Error).message);
     } finally {
-      rtmpLog.info("SRT source disconnected. Cleaning up...");
+      rtmpLog.debug("SRT source disconnected. Cleaning up...");
       state.isBroadcasting = false;
       state.sourceConnected = false;
       state.detectedBitrateKbps = null;
