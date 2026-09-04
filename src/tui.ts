@@ -133,24 +133,23 @@ export async function startTui(): Promise<void> {
     }
   }
 
-  // ── LAYOUT ─────────────────────────────────────────────────
-  // Header — neon + live dot + clock
+  // ── LAYOUT — VERTICAL WEB (no columns, todo apilado)
   const header = blessed.box({
     top: 0, left: 0, width: "100%", height: 5,
     tags: true, border: { type: "line" },
     style: { fg: "white", bg: NEON.bg, border: { fg: NEON.cyan } },
   });
 
-  // Now Playing — left 32% (42% height to leave room for action box below queue)
+  // Now Playing — full width, web-like hero
   const nowBox = blessed.box({
-    top: 5, left: 0, width: "32%", height: "42%",
+    top: 5, left: 0, width: "100%", height: "22%",
     label: "  ♫  NOW PLAYING  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.cyan }, label: { fg: NEON.cyan, bold: true } },
     padding: { left: 1, right: 1 },
   });
   const prog = blessed.progressbar({
     parent: nowBox,
-    top: 8, left: 1, width: "98%", height: 1,
+    top: 7, left: 1, width: "98%", height: 1,
     orientation: "horizontal",
     filled: 0,
     pch: "█",
@@ -158,17 +157,17 @@ export async function startTui(): Promise<void> {
     border: { type: "line" },
   });
 
-  // Streams — center 36% (42% to align with queue)
+  // Streams — full width, web section
   const streamBox = blessed.box({
-    top: 5, left: "32%", width: "36%", height: "42%",
+    top: "27%", left: 0, width: "100%", height: "22%",
     label: "  ◉  STREAMS  — click to open  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.magenta }, label: { fg: NEON.magenta, bold: true } },
     padding: { left: 1, right: 1 },
   });
 
-  // Queue — right 32% (leave room for action box below)
+  // Queue — full width, web section
   const queueBox = blessed.list({
-    top: 5, left: "68%", width: "32%", height: "42%",
+    top: "49%", left: 0, width: "100%", height: "22%",
     label: "  ≡  QUEUE  ", tags: true,
     border: { type: "line" }, style: { fg: "white", bg: NEON.panelBg, border: { fg: NEON.yellow }, label: { fg: NEON.yellow, bold: true }, selected: { bg: NEON.yellow, fg: "#1a1200", bold: true }, item: { fg: NEON.grey } },
     keys: true, mouse: true, vi: true,
@@ -205,9 +204,9 @@ export async function startTui(): Promise<void> {
   });
 
   // Health now as colored circle in header/side, not a button
-  // Music controls below Queue — Add Song / Add Folder (below queue, not covering logs)
+  // Music controls below Queue — vertical web, full width
   const queueActionBox = blessed.box({
-    top: "47%", left: "68%", width: "32%", height: "6%",
+    top: "71%", left: 0, width: "100%", height: "6%",
     tags: true,
     style: { bg: NEON.panelBg },
   });
@@ -235,25 +234,29 @@ export async function startTui(): Promise<void> {
     border: { type: "line" },
   });
 
-  // ── responsive — no logs panel, so panels use all space, buttons never covered
+  // ── responsive — vertical web, always stacked (no columns)
   const applyResponsive = () => {
-    const w = (screen as any).width as number;
-    const narrow = w < 100;
-    const tiny = w < 70;
-    if (narrow) {
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "28%";
-      (streamBox as any).top = "33%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "28%";
-      (queueBox as any).top = "61%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "20%";
-      (queueActionBox as any).top = "81%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
-      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); }
-      else { (queueBox as any).show(); (queueActionBox as any).show(); }
+    const h = (screen as any).height as number;
+    const tinyH = h < 30;
+    // Header 5 rows fixed, footer 1, rest vertical
+    if (tinyH) {
+      // Very small terminal — compact
+      (nowBox as any).top = 5; (nowBox as any).height = "18%";
+      (streamBox as any).top = "23%"; (streamBox as any).height = "22%";
+      (queueBox as any).top = "45%"; (queueBox as any).height = "20%";
+      (queueActionBox as any).top = "65%"; (queueActionBox as any).height = "6%";
     } else {
-      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "80%";
-      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "80%";
-      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "74%";
-      (queueActionBox as any).top = "79%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = "6%"; (queueActionBox as any).show();
-      (queueBox as any).show();
+      (nowBox as any).top = 5; (nowBox as any).height = "22%";
+      (streamBox as any).top = "27%"; (streamBox as any).height = "22%";
+      (queueBox as any).top = "49%"; (queueBox as any).height = "22%";
+      (queueActionBox as any).top = "71%"; (queueActionBox as any).height = "6%";
     }
+    // All full width, left 0, width 100% — web vertical
+    (nowBox as any).left = 0; (nowBox as any).width = "100%";
+    (streamBox as any).left = 0; (streamBox as any).width = "100%";
+    (queueBox as any).left = 0; (queueBox as any).width = "100%";
+    (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%";
+    (queueBox as any).show(); (queueActionBox as any).show();
     screen!.render();
   };
 
