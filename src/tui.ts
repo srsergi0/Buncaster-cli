@@ -201,40 +201,88 @@ export async function startTui(): Promise<void> {
     style: { fg: "white", bg: "#0f1419" },
   });
 
-  // Buttons — inside streamBox
+  // Buttons — MP3 + OPUS together (only these in Streams, as requested)
   const mkBtn = (opts: any) => blessed.button({
-    parent: streamBox, mouse: true, keys: true, shrink: true,
-    padding: { left: 2, right: 2 }, border: { type: "line" }, ...opts,
+    parent: streamBox, mouse: true, keys: true, shrink: false,
+    height: 3, padding: { left: 1, right: 1 }, border: { type: "line" }, align: "center", ...opts,
   });
   const btnMP3 = mkBtn({
-    top: 1, left: 1, content: "  ▶  MP3  ·  320k  ",
+    top: 2, left: "4%", width: "44%", content: "▶  MP3  ·  320k",
     style: { bg: NEON.green, fg: "#001210", bold: true, focus: { bg: NEON.yellow, fg: "#1a1200" }, hover: { bg: NEON.yellow, fg: "#1a1200" } },
   });
   const btnOpus = mkBtn({
-    top: 1, left: 20, content: "  ♫  OPUS  ·  96k  ",
+    top: 2, left: "52%", width: "44%", content: "♫  OPUS  ·  96k",
     style: { bg: NEON.magenta, fg: "white", bold: true, focus: { bg: NEON.yellow, fg: "#00120a" }, hover: { bg: NEON.yellow, fg: "#00120a" } },
   });
-  const btnHealth = mkBtn({
-    top: 1, left: 39, content: "  ♥  HEALTH  ",
-    style: { bg: "#1a1a2e", fg: "white", focus: { bg: NEON.cyan, fg: "#001210" }, hover: { bg: NEON.cyan, fg: "#001210" } },
+
+  // Health now as colored circle in header/side, not a button
+  // Music controls below Queue — Add Song / Add Folder (requested, below queue)
+  const queueActionBox = blessed.box({
+    top: "50%", left: "68%", width: "32%", height: 3,
+    tags: true,
+    style: { bg: NEON.panelBg },
   });
-  const btnMusic = mkBtn({
-    top: 4, left: 1, content: "  ♫  MUSIC FOLDER  ",
-    style: { bg: NEON.yellow, fg: "#1a1200", bold: true, focus: { bg: NEON.green, fg: "#001210" }, hover: { bg: NEON.green, fg: "#001210" } },
+  const btnAddSong = blessed.button({
+    parent: queueActionBox, mouse: true, keys: true, shrink: false,
+    top: 0, left: "2%", width: "46%", height: 3,
+    content: "+ Song", align: "center",
+    padding: { left: 1, right: 1 }, border: { type: "line" },
+    style: { bg: "#1e2a1e", fg: NEON.green, focus: { bg: NEON.green, fg: "#001210" }, hover: { bg: NEON.green, fg: "#001210" } },
   });
-  const btnStop = mkBtn({
-    top: 4, left: 22, content: "  ■  STOP  ",
-    style: { bg: NEON.red, fg: "white", bold: true, focus: { bg: "#ff6b6b", fg: "white" }, hover: { bg: "#ff6b6b", fg: "white" } },
+  const btnAddFolder = blessed.button({
+    parent: queueActionBox, mouse: true, keys: true, shrink: false,
+    top: 0, left: "52%", width: "46%", height: 3,
+    content: "+ Folder", align: "center",
+    padding: { left: 1, right: 1 }, border: { type: "line" },
+    style: { bg: "#1e1e2a", fg: NEON.cyan, focus: { bg: NEON.cyan, fg: "#001210" }, hover: { bg: NEON.cyan, fg: "#001210" } },
   });
+
+  // Stop — keep as requested, now as footer-right large button (not in Streams)
+  const btnStop = blessed.button({
+    parent: footer, mouse: true, keys: true, shrink: true,
+    top: 0, left: "82%", width: 16, height: 1,
+    content: " ■ STOP ", align: "center",
+    style: { bg: NEON.red, fg: "white", bold: true, focus: { bg: "#ff6b6b" }, hover: { bg: "#ff6b6b" } },
+    border: { type: "line" },
+  });
+
+  // ── responsive ───────────────────────────────────────────────
+  const applyResponsive = () => {
+    const w = (screen as any).width as number;
+    const narrow = w < 100;
+    const tiny = w < 70;
+    if (narrow) {
+      // Stack vertically — no more cut-off, buttons stay % based
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "100%"; (nowBox as any).height = "20%";
+      (streamBox as any).top = "25%"; (streamBox as any).left = 0; (streamBox as any).width = "100%"; (streamBox as any).height = "22%";
+      (queueBox as any).top = "47%"; (queueBox as any).left = 0; (queueBox as any).width = "100%"; (queueBox as any).height = "14%";
+      (queueActionBox as any).top = "61%"; (queueActionBox as any).left = 0; (queueActionBox as any).width = "100%"; (queueActionBox as any).height = 3; (queueActionBox as any).show();
+      (logBox as any).top = "64%"; (logBox as any).height = "30%";
+      if (tiny) { (queueBox as any).hide(); (queueActionBox as any).hide(); (logBox as any).top = "47%"; (logBox as any).height = "46%"; }
+      else { (queueBox as any).show(); (queueActionBox as any).show(); }
+    } else {
+      // Wide — 3 columns
+      (nowBox as any).top = 5; (nowBox as any).left = 0; (nowBox as any).width = "32%"; (nowBox as any).height = "45%";
+      (streamBox as any).top = 5; (streamBox as any).left = "32%"; (streamBox as any).width = "36%"; (streamBox as any).height = "45%";
+      (queueBox as any).top = 5; (queueBox as any).left = "68%"; (queueBox as any).width = "32%"; (queueBox as any).height = "45%";
+      (queueActionBox as any).top = "50%"; (queueActionBox as any).left = "68%"; (queueActionBox as any).width = "32%"; (queueActionBox as any).height = 3; (queueActionBox as any).show();
+      (queueBox as any).show();
+      (logBox as any).top = "53%"; (logBox as any).height = "40%";
+    }
+    screen!.render();
+  };
 
   screen.append(header);
   screen.append(nowBox);
   screen.append(streamBox);
   screen.append(queueBox);
+  screen.append(queueActionBox);
   screen.append(logBox);
   screen.append(footer);
+  applyResponsive();
   btnMP3.focus();
   screen.render();
+  screen.on("resize", applyResponsive);
 
   // ── interactions ────────────────────────────────────────────
   btnMP3.on("press", () => {
@@ -249,39 +297,65 @@ export async function startTui(): Promise<void> {
     try { Bun.spawn(["xdg-open", url], { stdout: "ignore", stderr: "ignore" }); } catch {}
     screen!.render();
   });
-  btnHealth.on("press", async () => {
+  // Health now as circle, not button — keep health check via H key
+  const doHealthCheck = async () => {
     try {
       const r = await fetch(`http://localhost:${config.httpPort}/health`);
       const j: any = await r.json();
-      logBox.log(`{cyan-fg}♥ Health — ${j.listeners} listeners · ${j.fallback.currentTrack || "silence"} · ${j.uptime}s{/}`);
-    } catch (e) { logBox.log(`{red-fg}Health failed: ${(e as Error).message}{/}`); }
+      const ok = j.status === "ok";
+      logBox.log(ok ? `{green-fg}● Health OK — ${j.listeners} listeners · ${j.fallback.currentTrack || "silence"} · ${j.uptime}s{/}` : `{red-fg}● Health FAIL{/}`);
+    } catch (e) { logBox.log(`{red-fg}● Health failed: ${(e as Error).message}{/}`); }
     screen!.render();
-  });
+  };
+
   btnStop.on("press", () => { logBox.log("{red-fg}■ Stopping…{/}"); screen!.render(); setTimeout(() => process.exit(0), 300); });
-  btnMusic.on("press", () => {
+
+  const promptMusic = (isFile: boolean) => {
     const cwd = process.cwd();
     const cur = (config as any).fallbackSource || "";
     const def = cur || (fs.existsSync(path.join(cwd, "musica")) ? "musica" : fs.existsSync(path.join(cwd, "music")) ? "music" : "musica");
+    const label = isFile ? "  ♫  Add Song  " : "  ♫  Add Folder  ";
+    const msg = isFile ? "  File path (mp3/flac/wav)" : "  Folder (empty = live-only)";
     const p = blessed.prompt({
       parent: screen!, top: "center", left: "center", width: 64, height: 9,
-      label: "  ♫  Music folder  ", tags: true, border: { type: "line" }, style: { bg: NEON.panelBg, fg: "white", border: { fg: NEON.yellow } },
+      label, tags: true, border: { type: "line" }, style: { bg: NEON.panelBg, fg: "white", border: { fg: isFile ? NEON.green : NEON.cyan } },
     });
-    p.input("  Folder (empty = live-only, silence)", def, (err: any, v: any) => {
+    p.input(msg, def, (err: any, v: any) => {
       p.destroy(); screen!.render();
-      if (err || v === undefined) { logBox.log("{grey-fg}Music change cancelled{/}"); screen!.render(); return; }
-      const folder = String(v).trim();
-      try {
-        setFallbackSource(folder);
-        logBox.log(folder === "" ? "{yellow-fg}🔇 Live-only — silence{/}" : fs.existsSync(folder) ? `{green-fg}🎵 Folder → "${folder}"{/}` : `{yellow-fg}Folder "${folder}" not found — silence{/}`);
-      } catch (e) { logBox.log(`{red-fg}Failed: ${(e as Error).message}{/}`); }
+      if (err || v === undefined) { logBox.log("{grey-fg}Cancelled{/}"); screen!.render(); return; }
+      const val = String(v).trim();
+      if (isFile) {
+        // Add single song to queue
+        if (!val) { logBox.log("{yellow-fg}No file given{/}"); screen!.render(); return; }
+        if (!fs.existsSync(val)) { logBox.log(`{yellow-fg}File "${val}" not found{/}`); screen!.render(); return; }
+        try {
+          // Use fallback queue: push to queue and trigger start if needed
+          const { state: st } = require("./state") as any;
+          // lazy import to avoid circular
+          st.fallbackQueue = st.fallbackQueue || [];
+          st.fallbackQueue.push(val);
+          logBox.log(`{green-fg}🎵 Added song → "${val.split("/").pop()}"{/}`);
+          // If nothing playing, start
+          const { startFallback } = require("./audio-router") as any;
+          try { startFallback(); } catch {}
+        } catch (e) { logBox.log(`{red-fg}Failed: ${(e as Error).message}{/}`); }
+      } else {
+        try {
+          setFallbackSource(val);
+          logBox.log(val === "" ? "{yellow-fg}🔇 Live-only — silence{/}" : fs.existsSync(val) ? `{green-fg}🎵 Folder → "${val}"{/}` : `{yellow-fg}Folder "${val}" not found — silence{/}`);
+        } catch (e) { logBox.log(`{red-fg}Failed: ${(e as Error).message}{/}`); }
+      }
       screen!.render();
     });
     screen!.render();
-  });
+  };
+  btnAddSong.on("press", () => promptMusic(true));
+  btnAddFolder.on("press", () => promptMusic(false));
 
   // Global keys: M/H/Q
-  screen.key(["m", "M"], () => (btnMusic as any).emit("press"));
-  screen.key(["h", "H"], () => (btnHealth as any).emit("press"));
+  screen.key(["m", "M"], () => (btnAddFolder as any).emit("press"));
+  screen.key(["a", "A"], () => (btnAddSong as any).emit("press"));
+  screen.key(["h", "H"], doHealthCheck);
 
   // ── render loop — world-class polish ────────────────────────
   let tick = 0;
@@ -331,9 +405,7 @@ export async function startTui(): Promise<void> {
       `{grey-fg}  SRT ingest{/}  srt://localhost:{bold}${config.srtPort}{/}?streamid=live/{cyan-fg}${String(config.rtmpStreamKey).slice(0,8)}…{/}\n` +
       `  {grey-fg}OBS → Service: Custom → Server: above{/}\n`
     );
-    // re-append buttons on top (blessed keeps them)
-    (btnMP3 as any).top = 7; (btnOpus as any).top = 7; (btnHealth as any).top = 7;
-    (btnMusic as any).top = 9; (btnStop as any).top = 9;
+    // Buttons are % positioned, no need to re-set top on update
 
     // Queue
     const items = (fallbackPlaylist as string[]).slice(0, 20).map((f, i) => {
@@ -375,7 +447,6 @@ export async function startTui(): Promise<void> {
   update();
   const iv = setInterval(update, 250); // 4fps for VU + progress — silky
   screen.on("destroy", () => clearInterval(iv));
-  screen.on("resize", () => screen!.render());
 }
 
 if (import.meta.main) { await startTui(); setInterval(()=>{}, 1000); }
