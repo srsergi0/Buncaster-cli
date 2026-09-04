@@ -217,7 +217,7 @@ if (shouldWizard) {
         validate: (v: string) => !v || isValidPort(v) ? true : "Port must be 1-65535",
       },
       {
-        type: "list",
+        type: "select",
         name: "wantFallback",
         message: "Fallback music?",
         choices: [
@@ -258,31 +258,40 @@ if (shouldWizard) {
         default: process.env.RTMP_STREAM_KEY || "",
       },
       {
-        type: "list",
+        type: "select",
         name: "logLevel",
         message: "Log level:",
-        choices: ["info", "debug", "warn", "error"],
+        choices: [
+          { name: "info", value: "info" },
+          { name: "debug", value: "debug" },
+          { name: "warn", value: "warn" },
+          { name: "error", value: "error" },
+        ],
         default: process.env.LOG_LEVEL || "info",
       },
     ]);
-  } catch (e) {
-    // Ctrl+C in inquirer throws ExitPromptError
-    console.log("\n  ✖ Wizard cancelled.\n");
-    process.exit(130);
-  }
 
-  // confirm before launch
-  const { confirmStart } = await inquirer.prompt([
-    {
-      type: "confirm",
-      name: "confirmStart",
-      message: "Start radio with this config?",
-      default: true,
-    },
-  ]);
-  if (!confirmStart) {
-    console.log("\n  Aborted. Run `bunradio --yes` for zero-config.\n");
-    process.exit(0);
+    // confirm before launch (still inside try so Ctrl+C is handled)
+    const { confirmStart } = await inquirer.prompt([
+      {
+        type: "confirm",
+        name: "confirmStart",
+        message: "Start radio with this config?",
+        default: true,
+      },
+    ]);
+    if (!confirmStart) {
+      console.log("\n  Aborted. Run `bunradio --yes` for zero-config.\n");
+      process.exit(0);
+    }
+  } catch (e: any) {
+    if (e?.name === "ExitPromptError" || e?.name === "CancelPromptError" || e?.message?.includes("User force closed")) {
+      console.log("\n  ✖ Wizard cancelled.\n");
+      process.exit(130);
+    }
+    console.error("\n  ✖ Wizard error:", e?.message || e);
+    if (e?.stack) console.error(e.stack);
+    process.exit(1);
   }
 }
 
