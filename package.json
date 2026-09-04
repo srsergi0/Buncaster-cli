@@ -8,9 +8,9 @@
     "bunradio": "src/cli.ts"
   },
   "scripts": {
-    "dev": "bun run --watch src/cli.ts -- --yes",
+    "dev": "bun run --watch src/cli.ts",
     "dev:server": "bun run --watch src/index-rtmp.ts",
-    "start": "bun run src/cli.ts -- --yes",
+    "start": "bun run src/cli.ts",
     "start:server": "bun run src/index-rtmp.ts",
     "cli": "bun run src/cli.ts",
     "build": "bun build --compile --outfile=bunradio src/cli.ts",
@@ -27,7 +27,6 @@
   },
   "dependencies": {
     "blessed": "^0.1.81",
-    "inquirer": "^14.2.1",
     "mcp-lite": "^0.10.0",
     "zod": "^4.4.3"
   }

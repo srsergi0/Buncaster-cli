@@ -103,7 +103,7 @@ export const deckB: Deck = {
 
 export let fallbackPlaylist: string[] = [];
 export let currentPlaylistIndex = 0;
-let isPlaylistInitialized = false;
+export let isPlaylistInitialized = false;
 
 // Variables de Control de Transición
 export let activeDeck: "A" | "B" = "A";
@@ -822,6 +822,21 @@ export function stopSilence() {
   if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
 }
 
+export function setFallbackSource(newSource: string) {
+  if ((config as any).fallbackSource === newSource) return;
+  (config as any).fallbackSource = newSource;
+  process.env.FALLBACK_SOURCE = newSource;
+  // Reset playlist so it rescans new folder
+  isPlaylistInitialized = false;
+  fallbackPlaylist.length = 0;
+  currentPlaylistIndex = 0;
+  stopPlaylistWatcher();
+  stopFallback();
+  stopSilence();
+  // startFallback will re-init with new source (or silence if empty)
+  startFallback();
+}
+
 export function startFallback() {
   // Ensure silence stops when music starts (fix: silence and fallback both writing to master caused rapid switching)
   stopSilence();
@@ -1236,12 +1251,13 @@ export async function runSrtListener() {
     if (state.shuttingDown) break;
 
     if (Date.now() < srtCooldownUntil) {
-      rtmpLog.warn(`[SRT] En cooldown por flaps. Ignorando hasta ${new Date(srtCooldownUntil).toISOString()}`);
+      rtmpLog.debug(`[SRT] cooldown until ${new Date(srtCooldownUntil).toISOString()}`);
       await new Promise((r) => setTimeout(r, 2000));
       continue;
     }
 
-    rtmpLog.info(`🎧 Ready — waiting for you to go live from OBS (SRT port ${config.srtPort})`);
+    // SRT ready is debug only (TUI shows status via side panel, not log spam)
+    rtmpLog.debug(`[SRT] listener restart (port ${config.srtPort})`);
     rtmpLog.debug(`SRT listener srt://${config.host}:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
 
     const args = [
@@ -1334,7 +1350,7 @@ export async function runSrtListener() {
       disconnectTimestamps.push(now);
       if (disconnectTimestamps.length > flapMaxCount) {
         srtCooldownUntil = now + flapCooldownMs;
-        rtmpLog.warn(`[SRT] Too many flaps (${disconnectTimestamps.length}) cooldown ${flapCooldownMs/1000}s`);
+        rtmpLog.debug(`[SRT] too many flaps (${disconnectTimestamps.length}) cooldown ${flapCooldownMs/1000}s`);
         disconnectTimestamps = [];
       }
       if (!state.shuttingDown && wasBroadcasting) {
