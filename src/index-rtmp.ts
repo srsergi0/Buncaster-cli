@@ -8,7 +8,7 @@
 import { config } from "./config";
 import { sysLog, httpLog } from "./logger";
 import { state } from "./state";
-import { startFallback, stopFallback, stopMasterEncoder, stopPlaylistWatcher, runSrtListener } from "./audio-router";
+import { startFallback, stopFallback, stopMasterEncoder, stopPlaylistWatcher, runSrtListener, stopSilence } from "./audio-router";
 import "./http-server"; // Levanta el servidor HTTP automáticamente al importar
 
 // =============================================================
@@ -35,8 +35,9 @@ console.log(`    Stream Key: ${config.rtmpStreamKey} (in streamid)`);
 console.log("");
 if (config.fallbackSource) {
   console.log(`  ▸ MUSIC: ${config.fallbackSource}`);
+  if (config.fallbackSource.trim() === "") console.log("    (live-only mode: silence until live)");
 } else {
-  console.log("  ▸ MUSIC: Not detected. Place a 'musica' or 'music' folder next to the binary.");
+  console.log("  ▸ MUSIC: Not configured (FALLBACK_SOURCE=\"\" => live-only, silence until live)");
 }
 console.log("");
 
@@ -68,6 +69,7 @@ function shutdown(signal: string): void {
   // Matar subprocesos de FFmpeg activos
   stopPlaylistWatcher();
   stopFallback();
+  stopSilence();
   stopMasterEncoder();
 
   if (state.sourceProcess) {

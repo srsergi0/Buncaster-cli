@@ -800,9 +800,31 @@ export function stopMasterEncoder() {
   state.masterProcess = null;
 }
 
+let silenceInterval: ReturnType<typeof setInterval> | null = null;
+
+function startSilence() {
+  if (silenceInterval) return;
+  if (state.isBroadcasting) return;
+  startMasterEncoder();
+  rtmpLog.info("No fallback configured — generating silence (live-only mode)");
+  const silenceChunk = new Uint8Array(4800 * 4); // 100ms s16le stereo 48k
+  silenceInterval = setInterval(() => {
+    if (state.isBroadcasting || state.shuttingDown) {
+      if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
+      return;
+    }
+    writeToMaster(silenceChunk);
+  }, 100);
+}
+
+export function stopSilence() {
+  if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
+}
+
 export function startFallback() {
-  if (!config.fallbackSource) {
-    rtmpLog.warn("No fallback file configured (FALLBACK_SOURCE empty).");
+  // Modo sin fallback: genera silencio hasta que llegue vivo
+  if (!config.fallbackSource || config.fallbackSource.trim() === "") {
+    startSilence();
     return;
   }
 
@@ -830,7 +852,8 @@ export function startFallback() {
     fileToPlay = state.fallbackQueue.shift()!;
   } else {
     if (fallbackPlaylist.length === 0) {
-      rtmpLog.warn("Fallback playlist is empty.");
+      rtmpLog.info("Fallback playlist empty — generating silence (live-only mode)");
+      startSilence();
       return;
     }
     fileToPlay = fallbackPlaylist[currentPlaylistIndex]!;
@@ -1113,10 +1136,10 @@ export async function runRtmpListener() {
 
           if (!state.isBroadcasting && sustained) {
             state.isBroadcasting = true;
+            stopSilence();
             liveTransitionStartTime = Date.now();
             isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-
-            const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live!)`;
+            const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
             rtmpLog.info(rtmpLiveMsg);
 
             state.currentTrack = null;
@@ -1252,14 +1275,15 @@ export async function runSrtListener() {
           state.totalBytesReceived += value.byteLength;
           if (firstAudioAt === 0) {
             firstAudioAt = Date.now();
-            rtmpLog.info(`[SRT] first audio ${value.byteLength}B recibido`);
+            rtmpLog.info(`[SRT] first audio ${value.byteLength}B received`);
           }
           const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
           if (!state.isBroadcasting && sustained) {
             state.isBroadcasting = true;
+            stopSilence();
             liveTransitionStartTime = Date.now();
             isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const liveMsg = config.lowLatency ? "SRT LIVE! (low-latency instant)" : `SRT LIVE! (after ${config.rtmpMinLiveSeconds}s sostenido)`;
+            const liveMsg = config.lowLatency ? "SRT LIVE! (low-latency instant)" : `SRT LIVE! (after ${config.rtmpMinLiveSeconds}s sustained)`;
             rtmpLog.info(liveMsg);
             state.currentTrack = null;
           }

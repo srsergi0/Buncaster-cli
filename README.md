@@ -2,7 +2,7 @@
 
 **Tu radio en un solo binario. Sin Node, sin npm.**
 
-Servidor de radio profesional built con **Bun** y **FFmpeg**. Acepta streaming en vivo desde OBS Studio via RTMP, genera una stream MP3 continua y gapless para oyentes, con sistema de fallback musical.
+Servidor de radio profesional built con **Bun** y **FFmpeg**. Acepta streaming en vivo desde OBS Studio via SRT, genera streams MP3 + Opus continuos y gapless para oyentes, con sistema de fallback musical opcional (live-only sin carpeta).
 
 ---
 
@@ -19,7 +19,9 @@ bunradio
 ### Opción 2: Docker
 
 ```bash
-docker run -p 8080:8080 -p 1935:1935 -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
+docker run -p 8080:8080 -p 1936:1936/udp -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
+# sin música (live-only, silencio hasta vivo):
+docker run -p 8080:8080 -p 1936:1936/udp -e FALLBACK_SOURCE="" ghcr.io/srsergi0/buncaster:latest
 ```
 
 ### Opción 3: Desde código fuente
@@ -42,27 +44,27 @@ BunRadio funciona **sin configuración**. Ejecuta el binario y:
 | Aspecto | Comportamiento automático |
 |---------|---------------------------|
 | **Puerto HTTP** | 8080 (o el siguiente disponible) |
-| **Puerto RTMP** | 1935 (o el siguiente disponible) |
+| **Puerto SRT** | 1936/udp (o el siguiente disponible) |
 | **Stream Key** | Se genera automáticamente (ej: `a1b2c3d4e5f6...`) |
-| **Música fallback** | Directorio donde se ejecuta el binario |
-| **Procesamiento de audio** | Activado por defecto (limiter + compressor) |
-| **Crossfade** | 2 segundos entre canciones |
+| **Música fallback** | Directorio donde se ejecuta el binario, o silencio si no hay audios / `FALLBACK_SOURCE=""` (live-only) |
+| **Procesamiento de audio** | Desactivado por defecto (`AUDIO_PROCESSING=false`, passthrough) |
+| **Crossfade** | 1s entre canciones, 0.2s al entrar vivo (low-latency) |
+| **Tier Opus** | `mp3 320k` + `opus 96k` (`/stream?format=opus`) |
 
 ### Formato de stream
 
-BunRadio soporta múltiples formatos de audio. Cambia con una sola variable:
+BunRadio emite **dual-tier**: `mp3 320k` (compat) + `opus 96k` (eco, ~10× eficiencia). El cliente elige:
 
 ```bash
-STREAM_FORMAT=ogg    # OGG Vorbis
-STREAM_FORMAT=aac    # AAC
-STREAM_FORMAT=opus   # Opus (mejor codec moderno)
-STREAM_FORMAT=flac   # FLAC lossless
-STREAM_FORMAT=mp3    # MP3 (default, máxima compatibilidad)
+http://localhost:8080/stream              # mp3 320k
+http://localhost:8080/stream?format=opus  # opus 96k
 ```
+
+Desactivar opus: `ENABLE_OPUS_TIER=false`.
 
 Docker:
 ```bash
-docker run -e STREAM_FORMAT=ogg -p 8080:8080 -p 1935:1935 \
+docker run -e ENABLE_OPUS_TIER=false -p 8080:8080 -p 1936:1936/udp \
   -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
 ```
 
@@ -79,14 +81,16 @@ Ver `.env.example` para todas las opciones.
 
 ---
 
-## 📡 OBS Studio
+## 📡 OBS Studio (SRT — sin plan B)
 
 1. Abre **OBS Studio**
 2. Ve a **Settings** → **Stream**
 3. **Service**: `Custom...`
-4. **Server**: `rtmp://localhost:1935/live`
-5. **Stream Key**: (la que aparece en la consola al iniciar)
+4. **Server**: `srt://localhost:1936?streamid=live/TU_STREAM_KEY`
+5. **Stream Key**: (la que aparece en la consola al iniciar, va dentro de `streamid`)
 6. Click **"Start Streaming"**
+
+> Alternativa FFmpeg: `ffmpeg -re -i input.mp3 -c:a libmp3lame -b:a 320k -f mpegts "srt://localhost:1936?streamid=live/TU_KEY"`
 
 ---
 
@@ -94,7 +98,7 @@ Ver `.env.example` para todas las opciones.
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
-| `GET /stream` | GET | Stream de audio MP3 |
+| `GET /stream` | GET | Stream MP3 320k (`?format=opus` → Opus 96k) |
 | `GET /health` | GET | Health check con diagnósticos |
 | `GET /status` | GET | Estado de la estación (JSON) |
 | `GET /metrics` | GET | Métricas Prometheus |

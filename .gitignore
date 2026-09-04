@@ -12,6 +12,9 @@ coverage
 
 # logs
 logs
+*.log
+bunradio.log
+opus-debug.log
 _.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
