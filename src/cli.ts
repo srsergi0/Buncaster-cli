@@ -217,10 +217,23 @@ if (shouldWizard) {
         validate: (v: string) => !v || isValidPort(v) ? true : "Port must be 1-65535",
       },
       {
+        type: "confirm",
+        name: "wantFallback",
+        message: "Enable fallback music? (no = live-only, silence until SRT)",
+        default: (() => {
+          const v = process.env.FALLBACK_SOURCE;
+          // "" explicitly means no fallback; undefined means default with music
+          if (v === "") return false;
+          return true;
+        })(),
+      },
+      {
         type: "input",
         name: "music",
-        message: 'Music fallback folder (FALLBACK_SOURCE, "" = live-only):',
+        message: "Music fallback folder (FALLBACK_SOURCE):",
         default: musicDefault,
+        when: (answers: any) => answers.wantFallback === true,
+        validate: (v: string) => v.trim() !== "" ? true : "Enter a folder path or choose No at previous step",
       },
       {
         type: "confirm",
@@ -283,8 +296,10 @@ if (shouldWizard) {
   // wizard overrides (only if not empty)
   if (wizardAnswers.port) setEnv("PORT", String(wizardAnswers.port).trim());
   if (wizardAnswers.srtPort) setEnv("SRT_PORT", String(wizardAnswers.srtPort).trim());
-  if (wizardAnswers.music !== undefined) {
-    // allow "" for live-only
+  if (wizardAnswers.wantFallback === false) {
+    process.env.FALLBACK_SOURCE = "";
+  } else if (wizardAnswers.music !== undefined) {
+    // allow "" for live-only (should not happen when wantFallback=true, but keep)
     process.env.FALLBACK_SOURCE = String(wizardAnswers.music);
   }
   if (wizardAnswers.opus !== undefined) process.env.ENABLE_OPUS_TIER = wizardAnswers.opus ? "true" : "false";
