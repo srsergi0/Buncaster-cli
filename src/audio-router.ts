@@ -585,6 +585,12 @@ function rescanPlaylist() {
     rtmpLog.debug(
       `[Playlist Watch] Playlist rebuilt: ${removed.length} removed, ${added.length} added. Total: ${fallbackPlaylist.length} tracks.`,
     );
+
+    // Si estábamos reproduciendo silencio porque la carpeta arrancó vacía, arrancar música inmediatamente
+    if (silenceInterval && fallbackPlaylist.length > 0 && !state.isBroadcasting) {
+      stopSilence();
+      startFallback();
+    }
   } catch (err) {
     rtmpLog.debug(`[Playlist Watch] Error rescanning folder: ${(err as Error).message}`);
   }
@@ -937,6 +943,7 @@ export function stopOpusEncoder() {
     state.opusProcess.kill();
   } catch {}
   state.opusProcess = null;
+  opusHeaders = null;
 }
 
 export function stopMasterEncoder() {
