@@ -15,10 +15,41 @@ export function checkStreamKey(req: Request): boolean {
   return header.slice(7) === config.rtmpStreamKey;
 }
 
+export function checkAdminAuth(req: Request): boolean {
+  // Si no se configuró contraseña de admin, permitimos acceso en desarrollo/local
+  if (!config.adminPassword) return true;
+
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader) return false;
+
+  if (authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7) === config.rtmpStreamKey;
+  }
+
+  if (authHeader.startsWith("Basic ")) {
+    try {
+      const b64 = authHeader.slice(6).trim();
+      const decoded = atob(b64);
+      const colonIdx = decoded.indexOf(":");
+      if (colonIdx === -1) return false;
+      const user = decoded.slice(0, colonIdx);
+      const pass = decoded.slice(colonIdx + 1);
+      return user === config.adminUser && pass === config.adminPassword;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 export function unauthorized(): Response {
   return new Response("Unauthorized", {
     status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="Admin", Bearer realm="BunRadio"' },
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Admin", Bearer realm="BunRadio"',
+      ...corsHeaders(),
+    },
   });
 }
 

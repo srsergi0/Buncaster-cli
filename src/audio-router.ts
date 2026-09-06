@@ -313,6 +313,8 @@ function applyVolume(chunk: Uint8Array, volume: number): Uint8Array {
 function writeToMaster(chunk: Uint8Array) {
   if (chunk.byteLength === 0) return;
 
+  state.lastPcmSampleTimeMs = Date.now();
+
   // Actualizar métricas del reloj multimedia basado en muestras (1 frame = 4 bytes stereo s16le)
   const frames = Math.floor(chunk.byteLength / 4);
   state.audioClockSamples += frames;
@@ -648,7 +650,101 @@ export function stopPlaylistWatcher() {
   rtmpLog.debug("[Playlist Watch] Watcher and polling stopped.");
 }
 
+// =============================================================
+// SUBPROCESS STDERR DRAINING & AUDIO WATCHDOG
+// =============================================================
+export function drainProcessStderr(proc: any, name: string): void {
+  if (!proc?.stderr) return;
+  const reader = proc.stderr.getReader();
+  const decoder = new TextDecoder();
+  const tail: string[] = [];
+  const MAX_TAIL = 10;
+
+  (async () => {
+    let remainder = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        const text = remainder + decoder.decode(value, { stream: true });
+        const lines = text.split("\n");
+        remainder = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          tail.push(trimmed);
+          if (tail.length > MAX_TAIL) tail.shift();
+        }
+      }
+    } catch {
+      // stream cerrado o terminado
+    } finally {
+      try { reader.cancel(); } catch {}
+    }
+  })();
+
+  if (proc.exited) {
+    proc.exited.then((exitCode: number) => {
+      if (exitCode !== 0 && tail.length > 0) {
+        rtmpLog.warn(`[Subprocess ${name}] exited with code ${exitCode}. Stderr tail:\n${tail.map((l) => `  [${name}] ${l}`).join("\n")}`);
+      }
+    }).catch(() => {});
+  }
+}
+
+export function checkAudioWatchdog(now = Date.now()): boolean {
+  if (!state.isBroadcasting) return false;
+  if (!state.sourceConnected) return false;
+  if (state.lastSourceAudioTimeMs === 0) return false;
+
+  const silenceDurationMs = now - state.lastSourceAudioTimeMs;
+  if (silenceDurationMs > 2500) {
+    rtmpLog.warn(`[Audio Watchdog] Frozen live audio detected (${silenceDurationMs}ms with zero frames). Forcing failover to fallback.`);
+    state.audioUnderruns++;
+    state.isBroadcasting = false;
+    state.sourceConnected = false;
+    state.lastSourceAudioTimeMs = 0;
+
+    if (state.sourceProcess) {
+      try {
+        state.sourceProcess.kill();
+      } catch {
+        /* noop */
+      }
+      state.sourceProcess = null;
+    }
+
+    startFallback();
+    return true;
+  }
+  return false;
+}
+
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+export function startAudioWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    if (state.shuttingDown) {
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+      return;
+    }
+    checkAudioWatchdog();
+  }, 1000);
+}
+
+export function stopAudioWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+}
+
 export function startMasterEncoder() {
+  startAudioWatchdog();
   if (state.masterProcess || nativeEncoder) {
     if (config.opusTierEnabled && !state.opusProcess) startOpusEncoder();
     return;
@@ -709,6 +805,7 @@ function startFfmpegMasterEncoder() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(state.masterProcess, "MasterEncoder");
 
     const reader = state.masterProcess.stdout.getReader();
     
@@ -779,6 +876,7 @@ export function startOpusEncoder() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(state.opusProcess, "OpusEncoder");
     const reader = state.opusProcess.stdout.getReader();
     const proc = state.opusProcess;
     proc.exited.then((code: number) => {
@@ -1010,6 +1108,7 @@ export function startFallback() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(currentDeck.process, `Deck-${currentDeck.id}`);
 
     const reader = currentDeck.process.stdout.getReader();
     pipeFallback(currentDeck, reader, session);
@@ -1274,6 +1373,7 @@ export async function runRtmpListener() {
         stdout: "pipe",
         stderr: "pipe",
       });
+      drainProcessStderr(state.sourceProcess, "RTMP-Source");
 
       state.sourceConnected = true;
       const reader = state.sourceProcess.stdout.getReader();
@@ -1298,6 +1398,7 @@ export async function runRtmpListener() {
         if (done) break;
 
         if (value.byteLength > 0) {
+          state.lastSourceAudioTimeMs = Date.now();
           state.totalBytesReceived += value.byteLength;
           if (firstAudioAt === 0) firstAudioAt = Date.now();
           const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
@@ -1426,6 +1527,7 @@ export async function runSrtListener() {
         stdout: "pipe",
         stderr: "pipe",
       });
+      drainProcessStderr(state.sourceProcess, "SRT-Source");
 
       state.sourceConnected = true;
       const reader = state.sourceProcess.stdout.getReader();
@@ -1444,6 +1546,7 @@ export async function runSrtListener() {
         const { done, value } = await reader.read();
         if (done) break;
         if (value.byteLength > 0) {
+          state.lastSourceAudioTimeMs = Date.now();
           state.totalBytesReceived += value.byteLength;
           if (firstAudioAt === 0) {
             firstAudioAt = Date.now();

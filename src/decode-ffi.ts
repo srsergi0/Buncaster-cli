@@ -205,57 +205,76 @@ function openTrack(path: string): TrackState {
   const S = symbols;
 
   const fmtBuf = new Uint8Array(8);
-  // Bun 1.3 no acepta strings en args FFI: ruta NUL-terminada como buffer
-  // (avformat la copia internamente, el buffer puede liberarse tras la llamada)
-  const pathBuf = new TextEncoder().encode(path + "\0");
-  let r = S.avformat_open_input(ptr(fmtBuf), ptr(pathBuf), null, null);
-  if (r < 0) throw new Error(`avformat_open_input falló (${r})`);
-  const fmtCtx = readPtr(ptr(fmtBuf));
-
-  r = S.avformat_find_stream_info(fmtCtx, null);
-  if (r < 0) throw new Error(`avformat_find_stream_info falló (${r})`);
-
-  const streams = readPtr(fmtCtx + AVFORMAT_STREAMS);
-  const decBuf = new Uint8Array(8);
-  const streamIdx = S.av_find_best_stream(fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, ptr(decBuf), null);
-  if (streamIdx < 0) throw new Error("archivo sin flujo de audio");
-  const decoder = readPtr(ptr(decBuf));
-
-  const avctx = S.avcodec_alloc_context3(decoder);
-  if (!avctx) throw new Error("avcodec_alloc_context3");
-
-  const streamPtr = readPtr(streams + streamIdx * 8);
-  const codecpar = readPtr(streamPtr + AVSTREAM_CODECPAR);
-  r = S.avcodec_parameters_to_context(avctx, codecpar);
-  if (r < 0) throw new Error(`avcodec_parameters_to_context falló (${r})`);
-  r = S.avcodec_open2(avctx, decoder, null);
-  if (r < 0) throw new Error(`avcodec_open2 falló (${r})`);
-
-  const inFmt = readI32(codecpar, CODEPAR_FORMAT);
-  const inRate = readI32(codecpar, CODEPAR_SAMPLE_RATE);
-  let inLayout = readI64(codecpar, CODEPAR_CHANNEL_LAYOUT);
-  if (!inLayout) {
-    inLayout = readI32(codecpar, CODEPAR_CHANNELS) === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
-  }
-
-  const swr = S.swr_alloc_set_opts(null, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 48000, inLayout, inFmt, inRate, 0, null);
-  if (!swr) throw new Error("swr_alloc_set_opts falló");
-  if (S.swr_init(swr) < 0) throw new Error("swr_init falló");
-
-  const frame = S.av_frame_alloc();
-  const pkt = S.av_packet_alloc();
-  if (!frame || !pkt) throw new Error("av_frame_alloc/av_packet_alloc falló");
-
   const ctxBuf = new Uint8Array(8);
   const swrBuf = new Uint8Array(8);
   const frameBuf = new Uint8Array(8);
   const pktBuf = new Uint8Array(8);
-  writePtr(ctxBuf, avctx);
-  writePtr(swrBuf, swr);
-  writePtr(frameBuf, frame);
-  writePtr(pktBuf, pkt);
 
-  return { fmtCtx, avctx, swr, frame, pkt, streamIdx, fmtBuf, ctxBuf, swrBuf, frameBuf, pktBuf, swrOutPtr: new Uint8Array(8) };
+  let fmtCtx = 0;
+  let avctx = 0;
+  let swr = 0;
+  let frame = 0;
+  let pkt = 0;
+
+  const cleanupPartial = () => {
+    if (swr) { writePtr(swrBuf, swr); try { S.swr_free(ptr(swrBuf)); } catch {} }
+    if (frame) { writePtr(frameBuf, frame); try { S.av_frame_free(ptr(frameBuf)); } catch {} }
+    if (pkt) { writePtr(pktBuf, pkt); try { S.av_packet_free(ptr(pktBuf)); } catch {} }
+    if (avctx) { writePtr(ctxBuf, avctx); try { S.avcodec_free_context(ptr(ctxBuf)); } catch {} }
+    if (fmtCtx) { writePtr(fmtBuf, fmtCtx); try { S.avformat_close_input(ptr(fmtBuf)); } catch {} }
+  };
+
+  try {
+    // Bun 1.3 no acepta strings en args FFI: ruta NUL-terminada como buffer
+    const pathBuf = new TextEncoder().encode(path + "\0");
+    let r = S.avformat_open_input(ptr(fmtBuf), ptr(pathBuf), null, null);
+    if (r < 0) throw new Error(`avformat_open_input falló (${r})`);
+    fmtCtx = readPtr(ptr(fmtBuf));
+
+    r = S.avformat_find_stream_info(fmtCtx, null);
+    if (r < 0) throw new Error(`avformat_find_stream_info falló (${r})`);
+
+    const streams = readPtr(fmtCtx + AVFORMAT_STREAMS);
+    const decBuf = new Uint8Array(8);
+    const streamIdx = S.av_find_best_stream(fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, ptr(decBuf), null);
+    if (streamIdx < 0) throw new Error("archivo sin flujo de audio");
+    const decoder = readPtr(ptr(decBuf));
+
+    avctx = S.avcodec_alloc_context3(decoder);
+    if (!avctx) throw new Error("avcodec_alloc_context3 falló");
+
+    const streamPtr = readPtr(streams + streamIdx * 8);
+    const codecpar = readPtr(streamPtr + AVSTREAM_CODECPAR);
+    r = S.avcodec_parameters_to_context(avctx, codecpar);
+    if (r < 0) throw new Error(`avcodec_parameters_to_context falló (${r})`);
+    r = S.avcodec_open2(avctx, decoder, null);
+    if (r < 0) throw new Error(`avcodec_open2 falló (${r})`);
+
+    const inFmt = readI32(codecpar, CODEPAR_FORMAT);
+    const inRate = readI32(codecpar, CODEPAR_SAMPLE_RATE);
+    let inLayout = readI64(codecpar, CODEPAR_CHANNEL_LAYOUT);
+    if (!inLayout) {
+      inLayout = readI32(codecpar, CODEPAR_CHANNELS) === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+    }
+
+    swr = S.swr_alloc_set_opts(null, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 48000, inLayout, inFmt, inRate, 0, null);
+    if (!swr) throw new Error("swr_alloc_set_opts falló");
+    if (S.swr_init(swr) < 0) throw new Error("swr_init falló");
+
+    frame = S.av_frame_alloc();
+    pkt = S.av_packet_alloc();
+    if (!frame || !pkt) throw new Error("av_frame_alloc/av_packet_alloc falló");
+
+    writePtr(ctxBuf, avctx);
+    writePtr(swrBuf, swr);
+    writePtr(frameBuf, frame);
+    writePtr(pktBuf, pkt);
+
+    return { fmtCtx, avctx, swr, frame, pkt, streamIdx, fmtBuf, ctxBuf, swrBuf, frameBuf, pktBuf, swrOutPtr: new Uint8Array(8) };
+  } catch (err) {
+    cleanupPartial();
+    throw err;
+  }
 }
 
 function closeTrack(st: TrackState) {
@@ -319,7 +338,10 @@ export class NativeDecoder {
           }
           return written;
         }
-        if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) continue;
+        if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) {
+          S.av_packet_unref(st.pkt);
+          continue;
+        }
         const sr = S.avcodec_send_packet(st.avctx, st.pkt);
         // avcodec_send_packet NO libera el paquete: sin av_packet_unref,
         // cada paquete (~192KB/s de audio comprimido) se fuga para siempre
@@ -333,12 +355,19 @@ export class NativeDecoder {
       const nbSamples = readI32(st.frame, AVFRAME_NB_SAMPLES);
       if (nbSamples <= 0) continue;
 
+      const remainingBytes = out.length - written;
+      const maxOutSamples = Math.floor(remainingBytes / 4);
+      if (maxOutSamples <= 0) {
+        S.av_frame_unref(st.frame);
+        break;
+      }
+
       writePtr(st.swrOutPtr, ptr(out) + written);
-      const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), 48000, st.frame, nbSamples);
+      const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), maxOutSamples, st.frame, nbSamples);
       S.av_frame_unref(st.frame); // liberar el búfer del frame decodificado
       if (outCount <= 0) continue;
       written += outCount * 4;
-      if (written >= out.length) break; // margen lleno: cortar (no debería pasar)
+      if (written >= out.length) break; // margen lleno
     }
     return written;
   }
@@ -349,38 +378,37 @@ export class NativeDecoder {
     let emittedBytes = 0;
     const t0 = performance.now();
 
-    while (!this.cancelled) {
-      // Pacing real-time (equivalente a -re): 192 B/ms, en slices de 50ms
-      // para que kill() responda en <50ms (antes esperaba hasta 1s el
-      // sleep completo, dejando un deck muerto escribiendo un chunk más).
-      const targetMs = emittedBytes / 192;
-      while (true) {
-        const wait = targetMs - (performance.now() - t0);
-        if (wait <= 0 || this.cancelled) break;
-        await Bun.sleep(Math.min(50, wait));
-      }
-      if (this.cancelled) break;
-      if (controller.desiredSize !== null && controller.desiredSize < -PCM_BYTES_PER_SECOND) {
-        await Bun.sleep(100); // consumidor lento: backoff simple
-        continue;
-      }
+    try {
+      while (!this.cancelled) {
+        // Pacing real-time (equivalente a -re): 192 B/ms, en slices de 50ms
+        const targetMs = emittedBytes / 192;
+        while (true) {
+          const wait = targetMs - (performance.now() - t0);
+          if (wait <= 0 || this.cancelled) break;
+          await Bun.sleep(Math.min(50, wait));
+        }
+        if (this.cancelled) break;
+        if (controller.desiredSize !== null && controller.desiredSize < -PCM_BYTES_PER_SECOND) {
+          await Bun.sleep(100); // consumidor lento: backoff simple
+          continue;
+        }
 
-      const n = this.fill(st, out, flushedState);
-      if (n <= 0) break; // EOF sin datos pendientes
+        const n = this.fill(st, out, flushedState);
+        if (n <= 0) break; // EOF sin datos pendientes
 
-      // Copia 1/s (allocación grande → mmap → el allocator la devuelve al OS)
-      const chunk = out.slice(0, n);
-      try {
-        controller.enqueue(chunk);
-      } catch {
-        break; // stream cancelado
+        const chunk = out.slice(0, n);
+        try {
+          controller.enqueue(chunk);
+        } catch {
+          break; // stream cancelado
+        }
+        emittedBytes += n;
+        if (n < PCM_BYTES_PER_SECOND) break; // chunk parcial = fin de pista
       }
-      emittedBytes += n;
-      if (n < PCM_BYTES_PER_SECOND) break; // chunk parcial = fin de pista
+    } finally {
+      try { controller.close(); } catch { /* noop */ }
+      closeTrack(st);
     }
-
-    try { controller.close(); } catch { /* noop */ }
-    closeTrack(st);
   }
 }
 

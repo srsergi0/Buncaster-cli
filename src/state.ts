@@ -51,9 +51,13 @@ export const state = {
   audioClockSamples: 0,
   audioSamplesProduced: 0,
   audioUnderruns: 0,
+  lastSourceAudioTimeMs: 0,
+  lastPcmSampleTimeMs: 0,
+  evictionsTotal: { slowClient: 0, backpressure: 0, timeout: 0 },
 
   fallbackQueue: [] as string[],
   currentTrack: null as ActiveTrackInfo | null,
   fallbackPaused: false,
 };
+
 

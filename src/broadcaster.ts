@@ -21,6 +21,14 @@ export function evictClient(id: string, reason: string): void {
   state.listenersMp3 = state.mp3Clients.size;
   state.listenersOpus = state.opusClients.size;
 
+  if (reason.includes("saturated") || reason.includes("backpressure")) {
+    state.evictionsTotal.backpressure++;
+  } else if (reason.includes("timeout")) {
+    state.evictionsTotal.timeout++;
+  } else {
+    state.evictionsTotal.slowClient++;
+  }
+
   httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size} (mp3:${state.listenersMp3}, opus:${state.listenersOpus})`);
 }
 

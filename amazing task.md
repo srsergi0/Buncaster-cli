@@ -244,19 +244,20 @@ graph TD
 
 | Tarea | Prioridad | Componente Principal | Estado |
 |---|---|---|---|
-| P0-1: Backpressure en bytes | **P0** | `http-server.ts` | ⏳ Pendiente |
-| P0-2: Inmutabilidad LAME FFI | **P0** | `lame-ffi.ts` / `audio-router.ts` | ⏳ Pendiente |
-| P0-3: Cadencia ICY & Prebuffer | **P0** | `icy-metadata.ts` | ⏳ Pendiente |
-| P0-4: Framing Ogg/Opus | **P0** | `audio-router.ts` | ⏳ Pendiente |
-| P0-5: Drenaje `stderr` & Watchdog | **P0** | `audio-router.ts` | ⏳ Pendiente |
-| P0-6: Auth & Admisión API | **P0** | `http-server.ts` | ⏳ Pendiente |
-| P1-1: Máquina de Estados Decks | **P1** | `audio-router.ts` | ⏳ Pendiente |
-| P1-2: Reloj de Audio por Muestras | **P1** | `audio-router.ts` | ⏳ Pendiente |
-| P1-3: DSP Compartido | **P1** | `audio-router.ts` | ⏳ Pendiente |
-| P1-4: Aislamiento Plano No-Crítico| **P1** | `logger.ts` / `http-server.ts` | ⏳ Pendiente |
-| P2-1: Ring Buffer Compartido | **P2** | `broadcaster.ts` | ⏳ Pendiente |
-| P2-2: Colecciones por Rendition | **P2** | `broadcaster.ts` | ⏳ Pendiente |
-| P2-3: Distribuidores Multinúcleo | **P2** | `http-server.ts` | ⏳ Pendiente |
-| P3-1: Blindaje Decoder FFI | **P3** | `decode-ffi.ts` | ⏳ Pendiente |
-| P3-2: Observabilidad Real | **P3** | `state.ts` / `http-server.ts` | ⏳ Pendiente |
-| P3-3: Suite de Estrés (A-H) | **P3** | `test/stress/*` | ⏳ Pendiente |
+| P0-1: Backpressure en bytes | **P0** | `http-server.ts` | ✅ Completado |
+| P0-2: Inmutabilidad LAME FFI | **P0** | `lame-ffi.ts` / `broadcaster.ts` | ✅ Completado |
+| P0-3: Cadencia ICY & Prebuffer | **P0** | `icy-metadata.ts` | ✅ Completado |
+| P0-4: Framing Ogg/Opus | **P0** | `audio-router.ts` | ✅ Completado |
+| P0-5: Drenaje `stderr` & Watchdog | **P0** | `audio-router.ts` | ✅ Completado |
+| P0-6: Auth & Admisión API | **P0** | `http-server.ts` / `http-helpers.ts` | ✅ Completado |
+| P1-1: Máquina de Estados Decks | **P1** | `audio-router.ts` | ✅ Completado |
+| P1-2: Reloj de Audio por Muestras | **P1** | `audio-router.ts` | ✅ Completado |
+| P1-3: DSP Compartido | **P1** | `audio-router.ts` | ⏳ Integrado con limitador suave |
+| P1-4: Aislamiento Plano No-Crítico| **P1** | `logger.ts` / `http-server.ts` | ✅ Completado |
+| P2-1: Ring Buffer Compartido | **P2** | `ring-buffer.ts` / `broadcaster.ts` | ✅ Completado |
+| P2-2: Colecciones por Rendition | **P2** | `broadcaster.ts` / `state.ts` | ✅ Completado |
+| P2-3: Distribuidores Multinúcleo | **P2** | `http-server.ts` | ⏳ Pendiente (Workers cluster) |
+| P3-1: Blindaje Decoder FFI | **P3** | `decode-ffi.ts` | ✅ Completado |
+| P3-2: Observabilidad Real | **P3** | `state.ts` / `http-server.ts` | ✅ Completado |
+| P3-3: Suite de Estrés & Fiabilidad| **P3** | `test/*` (35 tests) | ✅ Completado |
+

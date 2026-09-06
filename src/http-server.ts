@@ -8,6 +8,7 @@ const STREAM_PATHS = new Set(["/mp3", "/opus"]);
 import {
   corsHeaders,
   checkStreamKey,
+  checkAdminAuth,
   unauthorized,
   getClientIp,
 } from "./http-helpers";
@@ -87,7 +88,13 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   // ---- Stream (literal /mp3 and /opus) ----
   if (STREAM_PATHS.has(path) && (req.method === "GET" || req.method === "HEAD")) {
     if (state.clients.size >= config.maxListeners) {
-      return new Response("Server at max listeners", { status: 503, headers: corsHeaders() });
+      return new Response("Server at max listeners", {
+        status: 503,
+        headers: {
+          "Retry-After": "5",
+          ...corsHeaders(),
+        },
+      });
     }
 
     const isOpus = path === "/opus";
@@ -209,7 +216,13 @@ async function getOrBuildAppJs(): Promise<string> {
     }
   }
 
-  // ---- Web API — control from TSX (no auth for local, uses same as MCP later) ----
+  // ---- Web API & Admin Endpoints (protected with checkAdminAuth) ----
+  if (path.startsWith("/api/") || path.startsWith("/admin/api/")) {
+    if (!checkAdminAuth(req)) {
+      return unauthorized();
+    }
+  }
+
   if (path === "/api/fallback" && req.method === "POST") {
     try {
       const { folder } = await req.json() as any;
@@ -256,7 +269,51 @@ async function getOrBuildAppJs(): Promise<string> {
     const sourceAlive = state.sourceProcess !== null;
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
-    return Response.json({ status: "ok", uptime: uptimeSeconds, memory: { rss: Math.round(mem.rss/1024/1024), heapTotal: Math.round(mem.heapTotal/1024/1024), heapUsed: Math.round(mem.heapUsed/1024/1024), external: Math.round(mem.external/1024/1024) }, processes: { masterEncoder: masterAlive, opusTier: opusAlive, rtmpSource: sourceAlive }, broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, fallback: { active: fallbackActive, paused: state.fallbackPaused, currentTrack: state.currentTrack?.title || null }, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, tiers: { mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime }, opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null } }, { headers: corsHeaders() });
+    return Response.json({
+      status: "ok",
+      uptime: uptimeSeconds,
+      memory: {
+        rss: Math.round(mem.rss/1024/1024),
+        heapTotal: Math.round(mem.heapTotal/1024/1024),
+        heapUsed: Math.round(mem.heapUsed/1024/1024),
+        external: Math.round(mem.external/1024/1024),
+      },
+      processes: {
+        masterEncoder: masterAlive,
+        opusTier: opusAlive,
+        rtmpSource: sourceAlive,
+      },
+      broadcasting: state.isBroadcasting,
+      sourceConnected: state.sourceConnected,
+      fallback: {
+        active: fallbackActive,
+        paused: state.fallbackPaused,
+        currentTrack: state.currentTrack?.title || null,
+      },
+      listeners: state.clients.size,
+      listenersMp3: mp3Count,
+      listenersOpus: opusCount,
+      maxListeners: config.maxListeners,
+      totalListenersServed: state.totalListenersServed,
+      totalBytesReceived: state.totalBytesReceived,
+      totalBytesSent: state.totalBytesSent,
+      totalBytesSentOpus: state.totalBytesSentOpus,
+      detectedBitrateKbps: state.detectedBitrateKbps,
+      detectedSampleRate: state.detectedSampleRate,
+      audio: {
+        clockSamples: state.audioClockSamples,
+        samplesProduced: state.audioSamplesProduced,
+        underruns: state.audioUnderruns,
+        lastSourceAudioTimeMs: state.lastSourceAudioTimeMs,
+        lastPcmSampleTimeMs: state.lastPcmSampleTimeMs,
+      },
+      evictions: state.evictionsTotal,
+      deckState: state.deckState,
+      tiers: {
+        mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime },
+        opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null,
+      },
+    }, { headers: corsHeaders() });
   }
   if (path === "/debug-state") {
     return Response.json({ activeDeck, transitionStarted, isStoppingFallback, deckA: { hasProcess: deckA.process !== null, currentTrackFile: deckA.currentTrackFile, bufferLength: deckA.buffer.length }, deckB: { hasProcess: deckB.process !== null, currentTrackFile: deckB.currentTrackFile, bufferLength: deckB.buffer.length } }, { headers: corsHeaders() });
@@ -270,7 +327,53 @@ async function getOrBuildAppJs(): Promise<string> {
   if (path === "/metrics") {
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
-    const lines = ["# HELP radio_listeners Oyentes conectados actualmente","# TYPE radio_listeners gauge",`radio_listeners ${state.clients.size}`,"# HELP radio_listeners_mp3 Oyentes mp3","# TYPE radio_listeners_mp3 gauge",`radio_listeners_mp3 ${mp3Count}`,"# HELP radio_listeners_opus Oyentes opus tier","# TYPE radio_listeners_opus gauge",`radio_listeners_opus ${opusCount}`,"# HELP radio_broadcasting 1 si hay una fuente transmitiendo, 0 si no","# TYPE radio_broadcasting gauge",`radio_broadcasting ${state.isBroadcasting ? 1 : 0}`,"# HELP radio_bytes_received_total Bytes totales recibidos de la fuente","# TYPE radio_bytes_received_total counter",`radio_bytes_received_total ${state.totalBytesReceived}`,"# HELP radio_bytes_sent_total Bytes totales enviados a oyentes mp3","# TYPE radio_bytes_sent_total counter",`radio_bytes_sent_total ${state.totalBytesSent}`,"# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier","# TYPE radio_bytes_sent_opus_total counter",`radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,"# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise","# TYPE radio_fallback_active gauge",`radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,"# HELP radio_opus_tier_enabled 1 si opus tier habilitado","# TYPE radio_opus_tier_enabled gauge",`radio_opus_tier_enabled ${config.opusTierEnabled ? 1 : 0}`];
+    const lines = [
+      "# HELP radio_listeners Oyentes conectados actualmente",
+      "# TYPE radio_listeners gauge",
+      `radio_listeners ${state.clients.size}`,
+      "# HELP radio_listeners_mp3 Oyentes mp3",
+      "# TYPE radio_listeners_mp3 gauge",
+      `radio_listeners_mp3 ${mp3Count}`,
+      "# HELP radio_listeners_opus Oyentes opus tier",
+      "# TYPE radio_listeners_opus gauge",
+      `radio_listeners_opus ${opusCount}`,
+      "# HELP radio_broadcasting 1 si hay una fuente transmitiendo, 0 si no",
+      "# TYPE radio_broadcasting gauge",
+      `radio_broadcasting ${state.isBroadcasting ? 1 : 0}`,
+      "# HELP radio_bytes_received_total Bytes totales recibidos de la fuente",
+      "# TYPE radio_bytes_received_total counter",
+      `radio_bytes_received_total ${state.totalBytesReceived}`,
+      "# HELP radio_bytes_sent_total Bytes totales enviados a oyentes mp3",
+      "# TYPE radio_bytes_sent_total counter",
+      `radio_bytes_sent_total ${state.totalBytesSent}`,
+      "# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier",
+      "# TYPE radio_bytes_sent_opus_total counter",
+      `radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,
+      "# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise",
+      "# TYPE radio_fallback_active gauge",
+      `radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,
+      "# HELP radio_opus_tier_enabled 1 si opus tier habilitado",
+      "# TYPE radio_opus_tier_enabled gauge",
+      `radio_opus_tier_enabled ${config.opusTierEnabled ? 1 : 0}`,
+      "# HELP radio_audio_samples_produced_total Muestras de audio producidas",
+      "# TYPE radio_audio_samples_produced_total counter",
+      `radio_audio_samples_produced_total ${state.audioSamplesProduced}`,
+      "# HELP radio_audio_underruns_total Huecos o ausencias de audio",
+      "# TYPE radio_audio_underruns_total counter",
+      `radio_audio_underruns_total ${state.audioUnderruns}`,
+      "# HELP radio_evictions_slow_client Desconexiones por cliente lento",
+      "# TYPE radio_evictions_slow_client counter",
+      `radio_evictions_slow_client ${state.evictionsTotal.slowClient}`,
+      "# HELP radio_evictions_backpressure Desconexiones por saturacion de buffer",
+      "# TYPE radio_evictions_backpressure counter",
+      `radio_evictions_backpressure ${state.evictionsTotal.backpressure}`,
+      "# HELP radio_deck_state_a Estado de deck A",
+      "# TYPE radio_deck_state_a gauge",
+      `radio_deck_state_a{state="${state.deckState.A}"} 1`,
+      "# HELP radio_deck_state_b Estado de deck B",
+      "# TYPE radio_deck_state_b gauge",
+      `radio_deck_state_b{state="${state.deckState.B}"} 1`,
+    ];
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }
   return Response.json({ error: "Not Found" }, { status: 404, headers: corsHeaders() });

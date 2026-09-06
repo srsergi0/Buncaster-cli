@@ -28,6 +28,8 @@ export interface Config {
   opusTierEnabled: boolean;
   opusTierBitrateKbps: number;
   lowLatency: boolean;
+  adminUser: string;
+  adminPassword: string;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -121,6 +123,8 @@ function loadConfig(): Config {
     opusTierEnabled: envBool("ENABLE_OPUS_TIER", true),
     opusTierBitrateKbps: envInt("OPUS_TIER_BITRATE_KBPS", 96),
     lowLatency,
+    adminUser: process.env.ADMIN_USER || "admin",
+    adminPassword: process.env.ADMIN_PASSWORD || "",
   };
 
   return cfg;
