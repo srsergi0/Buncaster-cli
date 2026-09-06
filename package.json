@@ -16,7 +16,8 @@
     "build": "bun build --compile --outfile=bunradio src/cli.ts",
     "build:server": "bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
     "build:all": "bun build --compile --outfile=bunradio src/cli.ts && bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
-    "mcp": "bun run src/mcp-server.ts"
+    "mcp": "bun run src/mcp-server.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",

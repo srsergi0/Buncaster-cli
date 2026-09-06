@@ -7,13 +7,54 @@ function ts(): string {
   return new Date().toISOString();
 }
 
-function appendFileLog(scope: string, level: string, args: unknown[]) {
+import fs from "fs";
+
+let logQueue: string[] = [];
+let isFlushing = false;
+const MAX_BATCH_SIZE = 50;
+const FLUSH_INTERVAL_MS = 100;
+
+function flushLogsAsync() {
+  if (isFlushing || logQueue.length === 0) return;
+  isFlushing = true;
+  const batch = logQueue.splice(0, logQueue.length);
+  const text = batch.join("");
+
+  // Escribir asíncronamente en ambos archivos
+  Promise.all([
+    fs.promises.appendFile("opus-debug.log", text).catch(() => {}),
+    fs.promises.appendFile("bunradio.log", text).catch(() => {}),
+  ]).finally(() => {
+    isFlushing = false;
+    if (logQueue.length >= MAX_BATCH_SIZE) {
+      flushLogsAsync();
+    }
+  });
+}
+
+// Timer en segundo plano para vaciar logs periódicamente sin bloquear event loop
+const flushTimer = setInterval(flushLogsAsync, FLUSH_INTERVAL_MS);
+if (typeof flushTimer.unref === "function") flushTimer.unref();
+
+export function flushLogsSync() {
+  if (logQueue.length === 0) return;
+  const batch = logQueue.splice(0, logQueue.length);
+  const text = batch.join("");
   try {
-    const line = `[${ts()}] ${level} [${scope}] ${args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
-    // No reinicia terminal -- escribe a archivo persistente
-    require("fs").appendFileSync("opus-debug.log", line);
-    require("fs").appendFileSync("bunradio.log", line);
+    fs.appendFileSync("opus-debug.log", text);
+    fs.appendFileSync("bunradio.log", text);
   } catch {}
+}
+
+process.on("beforeExit", flushLogsSync);
+process.on("exit", flushLogsSync);
+
+function appendFileLog(scope: string, level: string, args: unknown[]) {
+  const line = `[${ts()}] ${level} [${scope}] ${args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
+  logQueue.push(line);
+  if (logQueue.length >= MAX_BATCH_SIZE) {
+    flushLogsAsync();
+  }
 }
 
 function makeLogger(scope: string) {

@@ -20,6 +20,8 @@ export interface ActiveTrackInfo {
   startedAt: number; // timestamp ms
 }
 
+export type DeckState = "IDLE" | "PRELOADING" | "READY" | "PLAYING" | "CROSSFADING" | "DRAINING" | "STOPPED";
+
 export const state = {
   clients: new Map<string, RadioClient>(),
   isBroadcasting: false,
@@ -36,7 +38,18 @@ export const state = {
   detectedBitrateKbps: null as number | null,
   detectedSampleRate: null as number | null,
 
+  // Deck Lifecycle & State Machine
+  deckState: { A: "IDLE" as DeckState, B: "IDLE" as DeckState },
+  deckSessions: { A: "", B: "" },
+  deckGenerations: { A: 0, B: 0 },
+
+  // Audio Clock & Precision Metrics
+  audioClockSamples: 0,
+  audioSamplesProduced: 0,
+  audioUnderruns: 0,
+
   fallbackQueue: [] as string[],
   currentTrack: null as ActiveTrackInfo | null,
   fallbackPaused: false,
 };
+

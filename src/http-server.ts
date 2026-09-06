@@ -154,12 +154,31 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
       return new Response("<h1>BUNRADIO</h1><p>Web UI not built — run <code>bun run build</code></p><p><a href='/mp3'>/mp3</a> <a href='/opus'>/opus</a></p>", { headers: { "Content-Type": "text/html", ...corsHeaders() } });
     }
   }
-  if (path === "/app.js") {
+let appJsCache: string | null = null;
+let appJsBuilding: Promise<string> | null = null;
+
+async function getOrBuildAppJs(): Promise<string> {
+  if (appJsCache) return appJsCache;
+  if (appJsBuilding) return appJsBuilding;
+
+  appJsBuilding = (async () => {
     try {
-      // Bun natively compiles TSX — build on the fly (cached)
       const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
       if (!build.success || !build.outputs[0]) throw new Error("Build failed");
       const js = await build.outputs[0].text();
+      appJsCache = js;
+      return js;
+    } finally {
+      appJsBuilding = null;
+    }
+  })();
+
+  return appJsBuilding;
+}
+
+  if (path === "/app.js") {
+    try {
+      const js = await getOrBuildAppJs();
       return new Response(js, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
     } catch (e: any) {
       return new Response(`console.error("Web build failed: ${String(e.message).replace(/"/g, "'")}");`, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
@@ -193,13 +212,8 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   }
   if (path === "/api/skip" && req.method === "POST") {
     try {
-      const { stopFallback, startFallback } = await import("./audio-router");
-      // @ts-ignore
-      const { state: st } = await import("./state");
-      // force skip: stop current and start next
-      try { stopFallback(); } catch {}
-      // reshuffle index
-      setTimeout(() => { try { startFallback(); } catch {} }, 100);
+      const { actionSkipFallback } = await import("./audio-router");
+      actionSkipFallback();
       return Response.json({ ok: true, message: "Skipped" }, { headers: corsHeaders() });
     } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
   }

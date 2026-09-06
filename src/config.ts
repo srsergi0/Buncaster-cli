@@ -40,6 +40,16 @@ function envInt(name: string, fallback: number): number {
   return n;
 }
 
+export function envFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (Number.isNaN(n) || n < 0) {
+    throw new Error(`Environment variable ${name} invalid: "${raw}" (expected a non-negative number)`);
+  }
+  return n;
+}
+
 function envBool(name: string, fallback: boolean): boolean {
   const val = process.env[name];
   if (!val) return fallback;
@@ -93,8 +103,8 @@ function loadConfig(): Config {
     fallbackBitrateKbps: envInt("STREAM_BITRATE_KBPS", 320),
     fallbackSource: process.env.FALLBACK_SOURCE !== undefined ? process.env.FALLBACK_SOURCE : "",
     audioProcessing: envBool("AUDIO_PROCESSING", false),
-    crossfadeSeconds: envInt("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
-    crossfadeLiveSeconds: envInt("CROSSFADE_LIVE_SECONDS", lowLatency ? 0.2 : 2),
+    crossfadeSeconds: envFloat("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
+    crossfadeLiveSeconds: envFloat("CROSSFADE_LIVE_SECONDS", lowLatency ? 0.2 : 2),
     rtmpStreamKey: rtmpKey,
     rtmpMinLiveSeconds: envInt("RTMP_MIN_LIVE_SECONDS", lowLatency ? 0 : 10),
     useNativeLame: (() => {

@@ -1,7 +1,7 @@
 import fs from "fs";
 import { config } from "./config";
 import { rtmpLog } from "./logger";
-import { state } from "./state";
+import { state, type DeckState } from "./state";
 import { broadcast, broadcastOpus } from "./broadcaster";
 import { bitrateDetector } from "./bitrate-detector";
 import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
@@ -11,16 +11,45 @@ import { FORMAT_CONFIG } from "./format-config";
 export let opusHeaders: Uint8Array | null = null;
 
 // =============================================================
-// 1. CLASE BUFFER FIFO DE AUDIO PCM
+// 1. CLASE BUFFER FIFO DE AUDIO PCM & ACUMULADOR DE RESIDUOS
 // =============================================================
-// Diseño "cero allocaciones": un deck secundario solo necesita la
-// ventana de crossfade de audio bufferizada (el resto de la canción se
-// descarta al llenarse el FIFO). Antes se bufferizaba la canción
-// completa (~46MB por tema a 192KB/s) y esa memoria quedaba retenida
-// hasta que el deck moría. pullInto() escribe en un buffer del pool PCM
-// (reutilizable) en vez de alocar uno nuevo por chunk.
-// 192KB/s = 48000Hz × 2ch × 2bytes.
-const DECK_BUFFER_CAP_BYTES = (config.crossfadeSeconds + 1) * 192_000;
+export class PcmResidueAccumulator {
+  private residue: Uint8Array = new Uint8Array(0);
+
+  /**
+   * Asegura que solo se entreguen frames completos de 4 bytes (stereo 16-bit).
+   * Retiene 1-3 bytes remanentes en memoria para unirlos con el siguiente chunk.
+   */
+  feed(chunk: Uint8Array): Uint8Array {
+    let combined: Uint8Array;
+    if (this.residue.length > 0) {
+      combined = new Uint8Array(this.residue.length + chunk.length);
+      combined.set(this.residue, 0);
+      combined.set(chunk, this.residue.length);
+    } else {
+      combined = chunk;
+    }
+
+    const frameBytes = 4;
+    const alignedLength = Math.floor(combined.length / frameBytes) * frameBytes;
+    const remainder = combined.length - alignedLength;
+
+    if (remainder > 0) {
+      this.residue = combined.slice(alignedLength);
+    } else {
+      this.residue = new Uint8Array(0);
+    }
+
+    if (alignedLength === 0) return new Uint8Array(0);
+    return combined.subarray(0, alignedLength);
+  }
+
+  reset() {
+    this.residue = new Uint8Array(0);
+  }
+}
+
+const DECK_BUFFER_CAP_BYTES = Math.max(384_000, Math.round((config.crossfadeSeconds + 1) * 192_000));
 class AudioStreamBuffer {
   private queue: Uint8Array[] = [];
   private totalBytes = 0;
@@ -31,6 +60,7 @@ class AudioStreamBuffer {
   }
 
   push(chunk: Uint8Array) {
+    if (chunk.byteLength === 0) return;
     this.queue.push(chunk);
     this.totalBytes += chunk.byteLength;
     if (this.maxBytes > 0) {
@@ -78,27 +108,45 @@ class AudioStreamBuffer {
 }
 
 // =============================================================
-// 2. ESTRUCTURA DE DECKS (REPRODUCTORES DE AUDIO)
+// 2. ESTRUCTURA DE DECKS CON MÁQUINA DE ESTADOS Y SESIÓN
 // =============================================================
-interface Deck {
+export interface Deck {
   id: "A" | "B";
+  state: DeckState;
+  sessionId: string;
+  generation: number;
   buffer: AudioStreamBuffer;
+  historyBuffer: AudioStreamBuffer;
+  residueAcc: PcmResidueAccumulator;
   process: any | null;
   currentTrackFile: string | null;
+  pendingTrackMeta: { file: string; title: string; artist: string; duration: number } | null;
 }
 
 export const deckA: Deck = {
   id: "A",
-  buffer: new AudioStreamBuffer(),
+  state: "IDLE",
+  sessionId: "",
+  generation: 0,
+  buffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  historyBuffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  residueAcc: new PcmResidueAccumulator(),
   process: null,
   currentTrackFile: null,
+  pendingTrackMeta: null,
 };
 
 export const deckB: Deck = {
   id: "B",
-  buffer: new AudioStreamBuffer(),
+  state: "IDLE",
+  sessionId: "",
+  generation: 0,
+  buffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  historyBuffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  residueAcc: new PcmResidueAccumulator(),
   process: null,
   currentTrackFile: null,
+  pendingTrackMeta: null,
 };
 
 export let fallbackPlaylist: string[] = [];
@@ -199,7 +247,7 @@ function persistMetaCache() {
 }
 
 // =============================================================
-// 5. MEZCLADORES MATEMÁTICOS DE PCM (TypedArrays)
+// 5. MEZCLADORES MATEMÁTICOS DE PCM (TypedArrays con Limitador Suave)
 // =============================================================
 function mixSamples(chunkA: Uint8Array, volA: number, chunkB: Uint8Array, volB: number): Uint8Array {
   const samplesA = new Int16Array(chunkA.buffer, chunkA.byteOffset, chunkA.byteLength / 2);
@@ -210,22 +258,36 @@ function mixSamples(chunkA: Uint8Array, volA: number, chunkB: Uint8Array, volB: 
   const outBuffer = acquirePcmBuffer(byteLength);
   const outSamples = new Int16Array(outBuffer, 0, length);
 
-  // Recorrer la parte solapada sin chequeo de undefined (fast path)
   const minLen = Math.min(samplesA.length, samplesB.length);
+  const THRESHOLD = 28000;
+  const CEILING = 32767;
+  const RANGE = CEILING - THRESHOLD;
+
+  // Soft-knee limiter: evita distorsión digital dura (clipping) al sumar pistas
   for (let i = 0; i < minLen; i++) {
-    let mixed = (samplesA[i]! * volA) + (samplesB[i]! * volB);
-    if (mixed > 32767) mixed = 32767;
-    else if (mixed < -32768) mixed = -32768;
-    outSamples[i] = mixed;
+    const mixed = (samplesA[i]! * volA) + (samplesB[i]! * volB);
+    const abs = Math.abs(mixed);
+    let val: number;
+    if (abs <= THRESHOLD) {
+      val = mixed;
+    } else {
+      const over = abs - THRESHOLD;
+      const compressed = THRESHOLD + RANGE * Math.tanh(over / RANGE);
+      val = Math.sign(mixed) * compressed;
+    }
+    outSamples[i] = Math.max(-32768, Math.min(32767, Math.round(val)));
   }
+
   // Cola del stream más largo (sin mezclar, solo volumen)
   if (samplesA.length > minLen) {
     for (let i = minLen; i < length; i++) {
-      outSamples[i] = samplesA[i]! * volA;
+      const scaled = Math.round(samplesA[i]! * volA);
+      outSamples[i] = Math.max(-32768, Math.min(32767, scaled));
     }
   } else if (samplesB.length > minLen) {
     for (let i = minLen; i < length; i++) {
-      outSamples[i] = samplesB[i]! * volB;
+      const scaled = Math.round(samplesB[i]! * volB);
+      outSamples[i] = Math.max(-32768, Math.min(32767, scaled));
     }
   }
 
@@ -249,6 +311,13 @@ function applyVolume(chunk: Uint8Array, volume: number): Uint8Array {
 }
 
 function writeToMaster(chunk: Uint8Array) {
+  if (chunk.byteLength === 0) return;
+
+  // Actualizar métricas del reloj multimedia basado en muestras (1 frame = 4 bytes stereo s16le)
+  const frames = Math.floor(chunk.byteLength / 4);
+  state.audioClockSamples += frames;
+  state.audioSamplesProduced += frames;
+
   // Opus tier - siempre escribe PCM crudo (o procesado) al encoder opus si está habilitado
   // Se hace primero para que opus tenga loudnorm vía ffmpeg -af si audioProcessing
   if (config.opusTierEnabled && state.opusProcess?.stdin) {
@@ -871,7 +940,6 @@ export function startFallback() {
     fileToPlay = state.fallbackQueue.shift()!;
   } else {
     if (fallbackPlaylist.length === 0) {
-      // already logged friendly message in initializeFallbackSource / startSilence
       rtmpLog.debug("Fallback playlist empty — silence");
       startSilence();
       return;
@@ -885,19 +953,44 @@ export function startFallback() {
     }
   }
 
-  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
-  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track: ${cleanName}`);
+  // Generar nueva sesión e incrementar generación para invalidar callbacks previos
+  currentDeck.generation++;
+  currentDeck.sessionId = `${currentDeck.id}-${currentDeck.generation}-${Date.now()}`;
+  currentDeck.state = "PRELOADING";
+  state.deckState[currentDeck.id] = currentDeck.state;
+  state.deckSessions[currentDeck.id] = currentDeck.sessionId;
+  state.deckGenerations[currentDeck.id] = currentDeck.generation;
+  const session = currentDeck.sessionId;
 
   currentDeck.currentTrackFile = fileToPlay;
+  currentDeck.pendingTrackMeta = null;
+  currentDeck.buffer.clear();
+  currentDeck.residueAcc.reset();
+
+  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
+  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track (Session ${session}): ${cleanName}`);
 
   getFileMetadata(fileToPlay).then((meta) => {
-    state.currentTrack = {
+    if (currentDeck.sessionId !== session) return; // Callback obsoleto ignorado
+
+    currentDeck.pendingTrackMeta = {
       file: fileToPlay,
       title: meta.title || cleanName.replace(/\.[^/.]+$/, ""),
       artist: meta.artist || "Artista Desconocido",
       duration: meta.duration,
-      startedAt: Date.now(),
     };
+
+    // Si el deck ya empezó a sonar en el master, activar metadatos de inmediato
+    if (currentDeck.state === "PLAYING" && activeDeck === currentDeck.id) {
+      state.currentTrack = {
+        file: fileToPlay,
+        title: currentDeck.pendingTrackMeta.title,
+        artist: currentDeck.pendingTrackMeta.artist,
+        duration: currentDeck.pendingTrackMeta.duration,
+        startedAt: Date.now(),
+      };
+      currentDeck.pendingTrackMeta = null;
+    }
   });
 
   const args = [
@@ -919,21 +1012,21 @@ export function startFallback() {
     });
 
     const reader = currentDeck.process.stdout.getReader();
-    pipeFallback(currentDeck, reader);
+    pipeFallback(currentDeck, reader, session);
   } catch (err) {
     rtmpLog.debug(`Error starting FFmpeg on Deck ${currentDeck.id}: ${(err as Error).message}`);
   }
 }
 
 // =============================================================
-// 4. BUCLE DE INGESTA DE FALLBACK (RELOJ CONDUCIDO POR EVENTOS)
+// 4. BUCLE DE INGESTA DE FALLBACK CON MÁQUINA DE ESTADOS
 // =============================================================
-async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint8Array>) {
+async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint8Array>, session: string) {
   const processInstance = deck.process;
   if (processInstance) {
     processInstance.exited.then((exitCode: number) => {
-      if (deck.process === processInstance && !transitionStarted) {
-        rtmpLog.debug(`[Deck ${deck.id}] Process ended (exitCode: ${exitCode}).`);
+      if (deck.process === processInstance && deck.sessionId === session && !transitionStarted) {
+        rtmpLog.debug(`[Deck ${deck.id}] Process ended (Session ${session}, exitCode: ${exitCode}).`);
         try {
           reader.cancel();
         } catch {
@@ -948,53 +1041,98 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
       const { done, value } = await reader.read();
       if (done) break;
 
-      // Si este deck es el secundario, simplemente almacenamos en búfer y no escribimos al maestro.
-      // El deck primario (reloj) consumirá este búfer en sus fundidos.
+      // Si la sesión fue sustituida o descartada, detener consumo
+      if (deck.sessionId !== session) break;
+
+      // Ensamblador de residuos PCM: garantiza frames completos de 4 bytes estéreo
+      const aligned = deck.residueAcc.feed(value);
+      if (aligned.length === 0) continue;
+
+      // Si este deck es el secundario, precarga su FIFO para el futuro crossfade
       if (activeDeck !== deck.id) {
-        deck.buffer.push(value);
+        deck.state = "PRELOADING";
+        state.deckState[deck.id] = deck.state;
+        deck.buffer.push(aligned);
         continue;
       }
+
+      // Deck activo: marcar PLAYING y sincronizar metadatos en el momento de emisión
+      if (deck.state !== "PLAYING" && !transitionStarted) {
+        deck.state = "PLAYING";
+        state.deckState[deck.id] = deck.state;
+        if (deck.pendingTrackMeta) {
+          state.currentTrack = {
+            file: deck.pendingTrackMeta.file,
+            title: deck.pendingTrackMeta.title,
+            artist: deck.pendingTrackMeta.artist,
+            duration: deck.pendingTrackMeta.duration,
+            startedAt: Date.now(),
+          };
+          deck.pendingTrackMeta = null;
+        }
+      }
+
+      // Retener en historyBuffer para permitir crossfade real cuando entra Live RTMP/SRT
+      deck.historyBuffer.push(aligned);
 
       // Si este deck es el primario (conductor del reloj de ingesta):
       if (!state.isBroadcasting) {
         if (transitionStarted) {
-          // Fundido cruzado activo entre Deck A y Deck B
+          deck.state = "CROSSFADING";
+          state.deckState[deck.id] = deck.state;
           const elapsed = Date.now() - crossfadeStartTime;
           const progress = Math.min(1.0, elapsed / (config.crossfadeSeconds * 1000));
           
-          // Equal-power crossfade (cosine) - potencia constante, evita dip -3dB de linear y pico por ganancia
-          // Solo se ejecuta durante ~2s, coste extra ~2x cos por chunk (~48Hz) despreciable
+          // Equal-power crossfade (cosine)
           const volOut = Math.cos(progress * Math.PI * 0.5);
           const volIn = Math.cos((1 - progress) * Math.PI * 0.5);
 
           const nextDeck = deck.id === "A" ? deckB : deckA;
-          const otherChunk = nextDeck.buffer.pull(value.length);
-          const mixed = mixSamples(value, volOut, otherChunk, volIn);
+          const otherChunk = nextDeck.buffer.pull(aligned.length);
+          const mixed = mixSamples(aligned, volOut, otherChunk, volIn);
 
           writeToMaster(mixed);
 
           if (progress >= 1.0) {
             transitionStarted = false;
-            // Detener el deck saliente (este deck)
             const oldDeck = deck;
+            oldDeck.state = "DRAINING";
+            state.deckState[oldDeck.id] = oldDeck.state;
+
             activeDeck = nextDeck.id; // El nuevo deck pasa a ser el primario
+            nextDeck.state = "PLAYING";
+            state.deckState[nextDeck.id] = nextDeck.state;
+
+            // Sincronizar metadatos de la nueva canción justo al completar el relevo
+            if (nextDeck.pendingTrackMeta) {
+              state.currentTrack = {
+                file: nextDeck.pendingTrackMeta.file,
+                title: nextDeck.pendingTrackMeta.title,
+                artist: nextDeck.pendingTrackMeta.artist,
+                duration: nextDeck.pendingTrackMeta.duration,
+                startedAt: Date.now(),
+              };
+              nextDeck.pendingTrackMeta = null;
+            }
             
             setTimeout(() => {
-              if (oldDeck.process) {
+              if (oldDeck.process && oldDeck.sessionId === session) {
                 try { oldDeck.process.kill(); } catch {}
                 oldDeck.process = null;
                 oldDeck.currentTrackFile = null;
                 oldDeck.buffer.clear();
+                oldDeck.state = "STOPPED";
+                state.deckState[oldDeck.id] = oldDeck.state;
               }
             }, 50);
           }
         } else if (isFallbackFadeInActive) {
-          // Fundido de entrada suave (después de desconexión de OBS) - low-latency usa 0.2s
+          // Fundido de entrada suave (después de desconexión de OBS)
           const fadeSec = config.lowLatency ? config.crossfadeLiveSeconds : config.crossfadeSeconds;
           const elapsed = Date.now() - fallbackFadeInStartTime;
           const progress = Math.min(1.0, elapsed / (fadeSec * 1000));
 
-          const faded = applyVolume(value, progress);
+          const faded = applyVolume(aligned, progress);
           writeToMaster(faded);
 
           if (progress >= 1.0) {
@@ -1002,7 +1140,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
           }
         } else {
           // Reproducción normal al 100% de volumen
-          writeToMaster(value);
+          writeToMaster(aligned);
 
           // Monitorear final de tema para disparar crossfade
           if (state.currentTrack && state.currentTrack.duration > 0) {
@@ -1022,29 +1160,33 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
       }
     }
   } catch (err) {
-    if (!isStoppingFallback) {
+    if (!isStoppingFallback && deck.sessionId === session) {
       rtmpLog.debug(`Error reading Deck stream ${deck.id}: ${(err as Error).message}`);
     }
   } finally {
-    const wasIntentionallyStopped = deck.process === null;
-    deck.process = null;
-    deck.currentTrackFile = null;
-    deck.buffer.clear();
+    if (deck.sessionId === session) {
+      const wasIntentionallyStopped = deck.process === null;
+      deck.process = null;
+      deck.currentTrackFile = null;
+      deck.buffer.clear();
+      deck.state = "STOPPED";
+      state.deckState[deck.id] = deck.state;
 
-    if (!state.isBroadcasting && !state.shuttingDown && !wasIntentionallyStopped) {
-      if (activeDeck === deck.id && !transitionStarted) {
-        // Caso normal: deck terminó sin crossfade activo
-        activeDeck = activeDeck === "A" ? "B" : "A";
-        startFallback();
-      } else if (activeDeck === deck.id && transitionStarted) {
-        // FIX: Deck terminó durante un crossfade — completar la transición
-        rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
-        transitionStarted = false;
-        activeDeck = deck.id === "A" ? "B" : "A";
-        const newDeck = activeDeck === "A" ? deckA : deckB;
-        newDeck.buffer.clear();
-        if (!newDeck.process) {
+      if (!state.isBroadcasting && !state.shuttingDown && !wasIntentionallyStopped) {
+        if (activeDeck === deck.id && !transitionStarted) {
+          // Caso normal: deck terminó sin crossfade activo
+          activeDeck = activeDeck === "A" ? "B" : "A";
           startFallback();
+        } else if (activeDeck === deck.id && transitionStarted) {
+          // Deck terminó durante un crossfade — completar la transición
+          rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
+          transitionStarted = false;
+          activeDeck = deck.id === "A" ? "B" : "A";
+          const newDeck = activeDeck === "A" ? deckA : deckB;
+          newDeck.buffer.clear();
+          if (!newDeck.process) {
+            startFallback();
+          }
         }
       }
     }
@@ -1063,9 +1205,15 @@ export function stopFallback() {
   }
   deckA.buffer.clear();
   deckB.buffer.clear();
-  
+  deckA.historyBuffer.clear();
+  deckB.historyBuffer.clear();
+  deckA.state = "STOPPED";
+  deckB.state = "STOPPED";
+  state.deckState.A = "STOPPED";
+  state.deckState.B = "STOPPED";
+  deckA.currentTrackFile = null;
+  deckB.currentTrackFile = null;
   state.currentTrack = null;
-  
   isStoppingFallback = false;
 }
 
@@ -1175,7 +1323,9 @@ export async function runRtmpListener() {
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
 
             const currentMusicDeck = activeDeck === "A" ? deckA : deckB;
-            const fallbackChunk = currentMusicDeck.buffer.pull(value.length);
+            const fallbackChunk = currentMusicDeck.historyBuffer.length > 0
+              ? currentMusicDeck.historyBuffer.pull(value.length)
+              : currentMusicDeck.buffer.pull(value.length);
 
             // Equal-power crossfade live (mismo coste despreciable, solo durante transición)
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
@@ -1317,7 +1467,9 @@ export async function runSrtListener() {
             const elapsed = Date.now() - liveTransitionStartTime;
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
             const curDeck = activeDeck === "A" ? deckA : deckB;
-            const fbChunk = curDeck.buffer.pull(value.length);
+            const fbChunk = curDeck.historyBuffer.length > 0
+              ? curDeck.historyBuffer.pull(value.length)
+              : curDeck.buffer.pull(value.length);
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
             const volFb = Math.cos(progress * Math.PI * 0.5);
             const mixed = mixSamples(value, volLive, fbChunk, volFb);
