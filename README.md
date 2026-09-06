@@ -1,14 +1,14 @@
 # 🎙️ BunRadio
 
-**Tu radio en un solo binario. Sin Node, sin npm.**
+**Your entire internet radio station in a single binary. No Node, no npm.**
 
-Servidor de radio profesional built con **Bun** y **FFmpeg**. Acepta streaming en vivo desde OBS Studio via SRT, genera streams MP3 + Opus continuos y gapless para oyentes, con sistema de fallback musical opcional (live-only sin carpeta).
+Professional broadcast radio server built with **Bun** and **FFmpeg**. Ingests live broadcast streams from OBS Studio via SRT, delivers continuous, gapless MP3 and Opus streams to listeners, and features an automated music fallback and priority queue system.
 
 ---
 
-## ⚡ Empieza en 3 segundos
+## ⚡ Quick Start in 3 Seconds
 
-### Opción 1: Instalador automático (recomendado)
+### Option 1: Automated Installer (Recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/srsergi0/Buncaster/main/install.sh | bash
@@ -16,107 +16,146 @@ source ~/.bashrc
 bunradio
 ```
 
-### Opción 2: Docker
+### Option 2: Docker
 
 ```bash
+# With music folder mounted:
 docker run -p 8080:8080 -p 1936:1936/udp -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
-# sin música (live-only, silencio hasta vivo):
+
+# Live-only (silence until you go live):
 docker run -p 8080:8080 -p 1936:1936/udp -e FALLBACK_SOURCE="" ghcr.io/srsergi0/buncaster:latest
 ```
 
-### Opción 3: Desde código fuente
+### Option 3: From Source
 
 ```bash
 bun install
-bun run dev -- -y              # Inicia inmediatamente sin preguntas
-# o con el asistente interactivo:
+
+# Start immediately without prompts (uses env or defaults):
+bun run dev -- -y
+
+# Or launch with the interactive setup wizard:
 bun run dev
 ```
 
-### Opción 4: Termux (Android)
+### Option 4: Termux (Android)
 
-Ver [docs/TERMUX.md](docs/TERMUX.md) para instrucciones detalladas. Documentación técnica adicional en [docs/](docs/).
-
----
-
-## 🎯 Zero Config y Opciones CLI
-
-BunRadio funciona **sin configuración** o con flags directas para entornos desatendidos:
-
-```bash
-# Flags disponibles en CLI:
-bun run dev -- -y                      # Modo no-interactivo (usa env o defaults)
-bun run dev -- -p 8080 -s 1936 -y      # Asigna puertos web y SRT directamente
-bun run dev -- --help                  # Muestra todas las opciones
-```
-
-| Aspecto | Comportamiento automático | Variable de entorno | Flag CLI |
-|---------|---------------------------|---------------------|----------|
-| **Puerto Web / Dashboard** | 8080 (o siguiente libre) | `PORT` / `DASHBOARD_PORT` | `-p`, `-d`, `--dashboard-port` |
-| **Puerto Streams (/mp3, /opus)**| Igual a Dashboard | `OUTPUT_PORT` / `STREAM_PORT` | `-p`, `-o`, `--output-port` |
-| **Puerto Ingesta SRT (OBS)** | 1936/udp (o siguiente) | `SRT_PORT` | `-s`, `--srt-port` |
-| **Modo No-Interactivo** | Desactivado (pregunta) | `NO_PROMPT=true` | `-y`, `--yes`, `--no-prompt` |
-| **Stream Key** | Generada automáticamente | `RTMP_STREAM_KEY` | - |
-| **Música fallback** | Silencio si no hay audios | `FALLBACK_SOURCE` | - |
-| **Tier Opus** | Activado (`mp3 320k` + `opus 96k`) | `ENABLE_OPUS_TIER=true` | - |
-
-### Formato de stream
-
-BunRadio emite **dual-tier** en tiempo real: `mp3 320k` (compatibilidad universal) + `opus 96k` (eficiencia extrema). Rutas directas:
-
-```bash
-http://localhost:8080/mp3                 # Stream MP3 directo
-http://localhost:8080/opus                # Stream Opus directo
-http://localhost:8080/stream              # Stream predeterminado
-http://localhost:8080/stream?format=opus  # Selector por query param
-```
+See [docs/TERMUX.md](docs/TERMUX.md) for detailed instructions. Additional architectural documentation is available in [docs/](docs/).
 
 ---
 
-## 📡 OBS Studio (Ingesta SRT en Directo)
+## 🎯 Zero Config & CLI Options
 
-1. Abre **OBS Studio** → **Ajustes** → **Emisión**
-2. **Servicio**: `Personalizado...` (*Custom...*)
-3. **Servidor**: 
+BunRadio runs **zero-config** out of the box, or accepts CLI flags for unattended/headless production deployments:
+
+```bash
+# CLI Flags:
+bun run dev -- -y                      # Non-interactive mode (uses env or defaults)
+bun run dev -- -p 8080 -s 1936 -y      # Explicit web and SRT ports
+bun run dev -- --help                  # Display all CLI flags and help
+```
+
+| Aspect | Default Behavior | Environment Variable | CLI Flag |
+|--------|------------------|----------------------|----------|
+| **Web / Dashboard Port** | 8080 (or next free port) | `PORT` / `DASHBOARD_PORT` | `-p`, `-d`, `--dashboard-port` |
+| **Streams Port (/mp3, /opus)** | Same as Dashboard | `OUTPUT_PORT` / `STREAM_PORT` | `-p`, `-o`, `--output-port` |
+| **OBS Ingest Port (SRT)** | 1936/udp (or next free) | `SRT_PORT` | `-s`, `--srt-port` |
+| **Non-Interactive Mode** | Disabled (interactive) | `NO_PROMPT=true` | `-y`, `--yes`, `--no-prompt` |
+| **Stream Key** | Auto-generated hex string | `RTMP_STREAM_KEY` | - |
+| **Music Fallback Source** | Current directory (or silence) | `FALLBACK_SOURCE` | - |
+| **Opus Tier** | Enabled (`mp3 320k` + `opus 96k`) | `ENABLE_OPUS_TIER=true` | - |
+
+### Stream Endpoints
+
+BunRadio broadcasts in real-time **dual-tier**: `mp3 320k` (universal compatibility) + `opus 96k` (high-fidelity extreme efficiency). Direct URLs:
+
+```bash
+http://localhost:8080/mp3                 # Direct MP3 320k stream
+http://localhost:8080/opus                # Direct Opus 96k stream
+http://localhost:8080/stream              # Default stream
+http://localhost:8080/stream?format=opus  # Query parameter selector
+```
+
+---
+
+## 📡 OBS Studio (Live SRT Ingestion)
+
+1. Open **OBS Studio** → **Settings** → **Stream**
+2. **Service**: `Custom...`
+3. **Server**: 
    ```text
-   srt://127.0.0.1:1936?streamid=live/TU_STREAM_KEY
+   srt://127.0.0.1:1936?streamid=live/YOUR_STREAM_KEY
    ```
-   *(Importante: usa `127.0.0.1` en Windows en vez de `localhost` para evitar problemas de resolución IPv6).*
-4. **Clave de retransmisión** (*Stream Key*): **DEJAR EN BLANCO** (el ID ya viaja dentro del parámetro `?streamid`).
-5. Clic en **"Iniciar Transmisión"**.
+   *(Important: use `127.0.0.1` on Windows instead of `localhost` to avoid IPv6 loopback resolution timeout).*
+4. **Stream Key**: **LEAVE COMPLETELY BLANK** (the ID is already embedded in the `?streamid` URL parameter).
+5. Click **"Start Streaming"**.
 
 ---
 
-## 🔌 API REST y Gestión de Colas
+## 🔌 REST API & Queue Management
 
-| Endpoint | Método | Auth | Descripción |
+| Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/stream` (o `/mp3`, `/opus`) | GET | Abierto | Emisión de audio en vivo continuo |
-| `/health` | GET | Abierto | Chequeo de salud verídico, uso de RAM y diagnósticos |
-| `/status` | GET | Abierto | Estado en tiempo real de la estación (JSON) |
-| `/metrics` | GET | Abierto | Métricas en formato Prometheus |
-| `/api/queue` | GET | Admin | Lista actual de pistas en la cola de reproducción |
-| `/api/queue/add` | POST | Admin | Añade una pista a la cola (`{"file": "musica/tema.mp3"}`) |
-| `/api/queue/remove` | POST | Admin | Elimina una pista por índice o archivo (`{"index": 0}`) |
-| `/api/queue/move` | POST | Admin | Reordena una pista en la cola (`{"from": 2, "to": 0}`) |
-| `/api/queue/clear` | POST | Admin | Vacía toda la cola de reproducción |
-| `/api/skip` | POST | Admin | Salta la canción actual de fallback |
-| `/api/fallback` | POST | Admin | Cambia la carpeta de música (`{"folder": "musica/rock"}`) |
-| `/api/stop` | POST | Admin | Apagado ordenado del servidor (*graceful shutdown*) |
+| `/stream` (or `/mp3`, `/opus`) | GET | Public | Continuous live audio stream |
+| `/health` | GET | Public | Health check with RAM usage, process state, and diagnostics |
+| `/status` | GET | Public | Real-time station metrics (JSON) |
+| `/metrics` | GET | Public | Prometheus-compatible metrics |
+| `/api/queue` | GET | Admin | Retrieve current ordered playback queue |
+| `/api/queue/add` | POST | Admin | Enqueue track (`{"file": "musica/track.mp3"}`) |
+| `/api/queue/remove` | POST | Admin | Remove track by index or filename (`{"index": 0}`) |
+| `/api/queue/move` | POST | Admin | Reorder track in queue (`{"from": 2, "to": 0}`) |
+| `/api/queue/clear` | POST | Admin | Clear entire playback queue |
+| `/api/skip` | POST | Admin | Skip current playing track |
+| `/api/fallback` | POST | Admin | Change music directory (`{"folder": "musica/rock"}`) |
+| `/api/stop` | POST | Admin | Graceful server shutdown |
 
 ---
 
-## 🔒 Seguridad y Control de Acceso
+## 🏥 Health Check & Observability
 
-Las rutas de control (`/api/*`, `/admin/api/*`, `/mcp`) están protegidas mediante:
-- **HTTP Basic Auth**: Credenciales configurables en `.env` (`ADMIN_USER`, `ADMIN_PASSWORD`).
-- **Bearer Token**: Cabecera `Authorization: Bearer <TU_STREAM_KEY>`.
+The `/health` endpoint exposes truthful runtime diagnostics:
+
+```json
+{
+  "status": "ok",
+  "uptime": 120,
+  "memory": { "rss": 85, "heapTotal": 4, "heapUsed": 38, "external": 42 },
+  "processes": { "masterEncoder": true, "opusTier": true, "rtmpSource": true },
+  "broadcasting": false,
+  "sourceConnected": false,
+  "fallback": {
+    "active": true,
+    "paused": false,
+    "currentTrack": "Artist - Song Title",
+    "queue": []
+  },
+  "listeners": 0,
+  "listenersMp3": 0,
+  "listenersOpus": 0,
+  "maxListeners": 500,
+  "audio": {
+    "clockSamples": 5760000,
+    "samplesProduced": 5760000,
+    "underruns": 0
+  }
+}
+```
+
+Docker includes an automated `HEALTHCHECK` running every 30 seconds.
 
 ---
 
-## 🤖 Integración MCP (Asistentes de IA)
+## 🔒 Security & Access Control
 
-BunRadio incluye un servidor MCP para controlar la radio desde Claude Desktop, Cursor o Windsurf:
+Control and mutation routes (`/api/*`, `/admin/api/*`, `/mcp`) are secured via:
+- **HTTP Basic Auth**: Configured via `.env` credentials (`ADMIN_USER`, `ADMIN_PASSWORD`).
+- **Bearer Token**: `Authorization: Bearer <YOUR_STREAM_KEY>`.
+
+---
+
+## 🤖 MCP Integration (AI Assistants)
+
+BunRadio includes a Model Context Protocol (MCP) server allowing direct control from Claude Desktop, Cursor, or Windsurf:
 
 ```json
 {
@@ -124,26 +163,26 @@ BunRadio incluye un servidor MCP para controlar la radio desde Claude Desktop, C
     "bunradio": {
       "url": "http://localhost:8080/mcp",
       "headers": {
-        "Authorization": "Bearer TU_STREAM_KEY"
+        "Authorization": "Bearer YOUR_STREAM_KEY"
       }
     }
   }
 }
 ```
 
-Herramientas MCP incluidas: `get_status`, `get_queue`, `push_to_queue`, `remove_from_queue`, `clear_queue`, `move_in_queue`, `skip_track`.
+Included MCP tools: `get_status`, `get_queue`, `push_to_queue`, `remove_from_queue`, `clear_queue`, `move_in_queue`, `skip_track`.
 
 ---
 
-## 📚 Documentación Técnica Detallada
+## 📚 Technical Documentation
 
-En la carpeta [`docs/`](docs/) encontrarás análisis a fondo:
-- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): Rendimiento de memoria, Ring Buffer y benchmarks.
-- [docs/SRC2.md](docs/SRC2.md) y [docs/IMPLEMENTACION.md](docs/IMPLEMENTACION.md): Auditoría de arquitectura y motores FFI.
-- [docs/RELAY-EXPLAINER.md](docs/RELAY-EXPLAINER.md): Arquitectura de escala mediante relays y CDN.
+Explore in-depth architectural audits and performance reports in the [`docs/`](docs/) directory:
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): Memory profiles, Audio Ring Buffer, and benchmarks.
+- [docs/SRC2.md](docs/SRC2.md) & [docs/IMPLEMENTACION.md](docs/IMPLEMENTACION.md): Architectural audit, FFI memory bounds, and state machines.
+- [docs/RELAY-EXPLAINER.md](docs/RELAY-EXPLAINER.md): Mass-scale fan-out architecture via relays and edge CDNs.
 
 ---
 
-## 📜 Licencia
+## 📜 License
 
 [MIT](LICENSE)
