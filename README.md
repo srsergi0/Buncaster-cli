@@ -28,122 +28,95 @@ docker run -p 8080:8080 -p 1936:1936/udp -e FALLBACK_SOURCE="" ghcr.io/srsergi0/
 
 ```bash
 bun install
-bun run start
+bun run dev -- -y              # Inicia inmediatamente sin preguntas
+# o con el asistente interactivo:
+bun run dev
 ```
 
 ### Opción 4: Termux (Android)
 
-Ver [TERMUX.md](TERMUX.md) para instrucciones detalladas.
+Ver [docs/TERMUX.md](docs/TERMUX.md) para instrucciones detalladas. Documentación técnica adicional en [docs/](docs/).
 
 ---
 
-## 🎯 Zero Config
+## 🎯 Zero Config y Opciones CLI
 
-BunRadio funciona **sin configuración**. Ejecuta el binario y:
+BunRadio funciona **sin configuración** o con flags directas para entornos desatendidos:
 
-| Aspecto | Comportamiento automático |
-|---------|---------------------------|
-| **Puerto HTTP** | 8080 (o el siguiente disponible) |
-| **Puerto SRT** | 1936/udp (o el siguiente disponible) |
-| **Stream Key** | Se genera automáticamente (ej: `a1b2c3d4e5f6...`) |
-| **Música fallback** | Directorio donde se ejecuta el binario, o silencio si no hay audios / `FALLBACK_SOURCE=""` (live-only) |
-| **Procesamiento de audio** | Desactivado por defecto (`AUDIO_PROCESSING=false`, passthrough) |
-| **Crossfade** | 1s entre canciones, 0.2s al entrar vivo (low-latency) |
-| **Tier Opus** | `mp3 320k` + `opus 96k` (`/stream?format=opus`) |
+```bash
+# Flags disponibles en CLI:
+bun run dev -- -y                      # Modo no-interactivo (usa env o defaults)
+bun run dev -- -p 8080 -s 1936 -y      # Asigna puertos web y SRT directamente
+bun run dev -- --help                  # Muestra todas las opciones
+```
+
+| Aspecto | Comportamiento automático | Variable de entorno | Flag CLI |
+|---------|---------------------------|---------------------|----------|
+| **Puerto Web / Dashboard** | 8080 (o siguiente libre) | `PORT` / `DASHBOARD_PORT` | `-p`, `-d`, `--dashboard-port` |
+| **Puerto Streams (/mp3, /opus)**| Igual a Dashboard | `OUTPUT_PORT` / `STREAM_PORT` | `-p`, `-o`, `--output-port` |
+| **Puerto Ingesta SRT (OBS)** | 1936/udp (o siguiente) | `SRT_PORT` | `-s`, `--srt-port` |
+| **Modo No-Interactivo** | Desactivado (pregunta) | `NO_PROMPT=true` | `-y`, `--yes`, `--no-prompt` |
+| **Stream Key** | Generada automáticamente | `RTMP_STREAM_KEY` | - |
+| **Música fallback** | Silencio si no hay audios | `FALLBACK_SOURCE` | - |
+| **Tier Opus** | Activado (`mp3 320k` + `opus 96k`) | `ENABLE_OPUS_TIER=true` | - |
 
 ### Formato de stream
 
-BunRadio emite **dual-tier**: `mp3 320k` (compat) + `opus 96k` (eco, ~10× eficiencia). El cliente elige:
+BunRadio emite **dual-tier** en tiempo real: `mp3 320k` (compatibilidad universal) + `opus 96k` (eficiencia extrema). Rutas directas:
 
 ```bash
-http://localhost:8080/stream              # mp3 320k
-http://localhost:8080/stream?format=opus  # opus 96k
+http://localhost:8080/mp3                 # Stream MP3 directo
+http://localhost:8080/opus                # Stream Opus directo
+http://localhost:8080/stream              # Stream predeterminado
+http://localhost:8080/stream?format=opus  # Selector por query param
 ```
 
-Desactivar opus: `ENABLE_OPUS_TIER=false`.
+---
 
-Docker:
-```bash
-docker run -e ENABLE_OPUS_TIER=false -p 8080:8080 -p 1936:1936/udp \
-  -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
-```
+## 📡 OBS Studio (Ingesta SRT en Directo)
 
-### Configuración opcional
-
-Solo edita lo que quieras cambiar via variables de entorno o archivo `.env`:
-
-```bash
-# Ejemplo: cambiar puerto
-PORT=9090
-```
-
-Ver `.env.example` para todas las opciones.
+1. Abre **OBS Studio** → **Ajustes** → **Emisión**
+2. **Servicio**: `Personalizado...` (*Custom...*)
+3. **Servidor**: 
+   ```text
+   srt://127.0.0.1:1936?streamid=live/TU_STREAM_KEY
+   ```
+   *(Importante: usa `127.0.0.1` en Windows en vez de `localhost` para evitar problemas de resolución IPv6).*
+4. **Clave de retransmisión** (*Stream Key*): **DEJAR EN BLANCO** (el ID ya viaja dentro del parámetro `?streamid`).
+5. Clic en **"Iniciar Transmisión"**.
 
 ---
 
-## 📡 OBS Studio (SRT — sin plan B)
+## 🔌 API REST y Gestión de Colas
 
-1. Abre **OBS Studio**
-2. Ve a **Settings** → **Stream**
-3. **Service**: `Custom...`
-4. **Server**: `srt://localhost:1936?streamid=live/TU_STREAM_KEY`
-5. **Stream Key**: (la que aparece en la consola al iniciar, va dentro de `streamid`)
-6. Click **"Start Streaming"**
-
-> Alternativa FFmpeg: `ffmpeg -re -i input.mp3 -c:a libmp3lame -b:a 320k -f mpegts "srt://localhost:1936?streamid=live/TU_KEY"`
-
----
-
-## 🔌 API REST
-
-| Endpoint | Método | Descripción |
-|----------|--------|-------------|
-| `GET /stream` | GET | Stream MP3 320k (`?format=opus` → Opus 96k) |
-| `GET /health` | GET | Health check con diagnósticos |
-| `GET /status` | GET | Estado de la estación (JSON) |
-| `GET /metrics` | GET | Métricas Prometheus |
+| Endpoint | Método | Auth | Descripción |
+|----------|--------|------|-------------|
+| `/stream` (o `/mp3`, `/opus`) | GET | Abierto | Emisión de audio en vivo continuo |
+| `/health` | GET | Abierto | Chequeo de salud verídico, uso de RAM y diagnósticos |
+| `/status` | GET | Abierto | Estado en tiempo real de la estación (JSON) |
+| `/metrics` | GET | Abierto | Métricas en formato Prometheus |
+| `/api/queue` | GET | Admin | Lista actual de pistas en la cola de reproducción |
+| `/api/queue/add` | POST | Admin | Añade una pista a la cola (`{"file": "musica/tema.mp3"}`) |
+| `/api/queue/remove` | POST | Admin | Elimina una pista por índice o archivo (`{"index": 0}`) |
+| `/api/queue/move` | POST | Admin | Reordena una pista en la cola (`{"from": 2, "to": 0}`) |
+| `/api/queue/clear` | POST | Admin | Vacía toda la cola de reproducción |
+| `/api/skip` | POST | Admin | Salta la canción actual de fallback |
+| `/api/fallback` | POST | Admin | Cambia la carpeta de música (`{"folder": "musica/rock"}`) |
+| `/api/stop` | POST | Admin | Apagado ordenado del servidor (*graceful shutdown*) |
 
 ---
 
-## 🏥 Health Check
+## 🔒 Seguridad y Control de Acceso
 
-El endpoint `/health` retorna diagnósticos completos:
-
-```json
-{
-  "status": "ok",
-  "uptime": 120,
-  "memory": { "rss": 72, "heapTotal": 2, "heapUsed": 42, "external": 41 },
-  "processes": { "masterEncoder": false, "rtmpSource": true },
-  "broadcasting": false,
-  "fallback": { "active": true, "currentTrack": "I'm on My Way" },
-  "listeners": 0
-}
-```
-
-Docker incluye `HEALTHCHECK` automático cada 30 segundos.
+Las rutas de control (`/api/*`, `/admin/api/*`, `/mcp`) están protegidas mediante:
+- **HTTP Basic Auth**: Credenciales configurables en `.env` (`ADMIN_USER`, `ADMIN_PASSWORD`).
+- **Bearer Token**: Cabecera `Authorization: Bearer <TU_STREAM_KEY>`.
 
 ---
 
-## 🔒 Seguridad
+## 🤖 Integración MCP (Asistentes de IA)
 
-El **stream key** (que aparece en la consola al iniciar) se usa como token de autenticación para las rutas protegidas. Pásalo como `Bearer` token:
-
-| Ruta | Método | Protección |
-|------|--------|------------|
-| `/mcp` | POST | Stream key (Bearer) |
-| `/stream` | GET | Abierto |
-| `/health` | GET | Abierto |
-| `/status` | GET | Abierto |
-| `/metrics` | GET | Abierto |
-
----
-
-## 🤖 MCP Integration (AI Assistants)
-
-BunRadio incluye un servidor MCP para controlar la radio desde Claude Desktop, Cursor, o Windsurf.
-
-### Configuración
+BunRadio incluye un servidor MCP para controlar la radio desde Claude Desktop, Cursor o Windsurf:
 
 ```json
 {
@@ -158,15 +131,16 @@ BunRadio incluye un servidor MCP para controlar la radio desde Claude Desktop, C
 }
 ```
 
-### Herramientas disponibles
+Herramientas MCP incluidas: `get_status`, `get_queue`, `push_to_queue`, `remove_from_queue`, `clear_queue`, `move_in_queue`, `skip_track`.
 
-- `get_status` - Estado de la radio
-- `get_queue` - Cola de reproducción
-- `push_to_queue` - Agregar pista
-- `skip_track` - Saltar pista
-- `shuffle_playlist` - Re-shuffle
-- `toggle_fallback` - Pausar/reanudar
-- Y más...
+---
+
+## 📚 Documentación Técnica Detallada
+
+En la carpeta [`docs/`](docs/) encontrarás análisis a fondo:
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): Rendimiento de memoria, Ring Buffer y benchmarks.
+- [docs/SRC2.md](docs/SRC2.md) y [docs/IMPLEMENTACION.md](docs/IMPLEMENTACION.md): Auditoría de arquitectura y motores FFI.
+- [docs/RELAY-EXPLAINER.md](docs/RELAY-EXPLAINER.md): Arquitectura de escala mediante relays y CDN.
 
 ---
 
