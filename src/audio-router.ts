@@ -532,7 +532,16 @@ function pollForChanges() {
  * y ajusta el índice actual para no perder la posición.
  */
 function rescanPlaylist() {
-  if (!config.fallbackSource || !isPlaylistInitialized) return;
+  if (!config.fallbackSource) return;
+
+  if (!isPlaylistInitialized) {
+    initializeFallbackSource();
+    if (fallbackPlaylist.length > 0 && !state.isBroadcasting) {
+      stopSilence();
+      startFallback();
+    }
+    return;
+  }
 
   try {
     const stat = fs.statSync(config.fallbackSource);
@@ -898,6 +907,32 @@ export function startOpusEncoder() {
   }
 }
 
+export function extractOggOpusHeaders(buf: Uint8Array): Uint8Array | null {
+  let offset = 0;
+  let pagesFound = 0;
+  while (offset + 27 <= buf.length) {
+    if (buf[offset] !== 0x4f || buf[offset + 1] !== 0x67 || buf[offset + 2] !== 0x67 || buf[offset + 3] !== 0x73) {
+      break;
+    }
+    const numSegments = buf[offset + 26]!;
+    if (offset + 27 + numSegments > buf.length) break;
+
+    let payloadLen = 0;
+    for (let i = 0; i < numSegments; i++) {
+      payloadLen += buf[offset + 27 + i]!;
+    }
+    const pageLen = 27 + numSegments + payloadLen;
+    if (offset + pageLen > buf.length) break;
+
+    pagesFound++;
+    offset += pageLen;
+    if (pagesFound === 2) {
+      return buf.slice(0, offset);
+    }
+  }
+  return null;
+}
+
 let opusPackets = 0;
 let opusBytesTotal = 0;
 async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
@@ -908,19 +943,18 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
         rtmpLog.debug("Opus stream closed");
         break;
       }
-      // Captura headers OpusHead/OpusTags (primer chunk contiene OggS + OpusHead)
+      // Captura cabeceras OpusHead/OpusTags con parsing exacto de páginas Ogg
       if (!opusHeaders) {
-        const text = new TextDecoder().decode(value.subarray(0, Math.min(value.length, 200)));
-        if (text.includes("OpusHead")) {
-          // Guarda todo el primer chunk como headers (contiene ambas cabeceras)
-          opusHeaders = value.slice();
-          rtmpLog.debug(`[Opus Tier] headers captured ${opusHeaders.length}B`);
-          rtmpLog.debug(`[Opus Debug] headers hex ${Array.from(value.subarray(0,32)).map(b=>b.toString(16).padStart(2,"0")).join(" ")}`);
-        } else if (value.length < 8192) {
-          // Primer chunk pequeño sin OpusHead aún, acumular? Por ahora guarda primer chunk
-          // No debería pasar, pero por seguridad guarda primer chunk
-          opusHeaders = value.slice();
-          rtmpLog.debug(`[Opus Tier] headers (fallback) ${opusHeaders.length}B`);
+        const exactHeaders = extractOggOpusHeaders(value);
+        if (exactHeaders) {
+          opusHeaders = exactHeaders;
+          rtmpLog.debug(`[Opus Tier] Exact Ogg/Opus header pages captured: ${opusHeaders.length}B`);
+        } else {
+          const text = new TextDecoder().decode(value.subarray(0, Math.min(value.length, 200)));
+          if (text.includes("OpusHead")) {
+            opusHeaders = value.slice();
+            rtmpLog.debug(`[Opus Tier] headers captured (fallback) ${opusHeaders.length}B`);
+          }
         }
       }
       opusPackets++;
@@ -944,6 +978,7 @@ export function stopOpusEncoder() {
   } catch {}
   state.opusProcess = null;
   opusHeaders = null;
+  preBufferOpus.reset();
 }
 
 export function stopMasterEncoder() {
@@ -1342,6 +1377,7 @@ export function actionSkipFallback() {
 // =============================================================
 export async function runRtmpListener() {
   startMasterEncoder();
+  const rtmpResidueAccumulator = new PcmResidueAccumulator();
 
   // Detección de flaps: si RTMP se desconecta muchas veces en poco tiempo,
   // se ignora la fuente durante un periodo de cooldown para no romper
@@ -1401,27 +1437,26 @@ export async function runRtmpListener() {
       // conexiones breves/sondas que provocan cortes en el respaldo.
       let firstAudioAt = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value: rawValue } = await reader.read();
         if (done) break;
 
-        if (value.byteLength > 0) {
-          state.lastSourceAudioTimeMs = Date.now();
-          state.totalBytesReceived += value.byteLength;
-          if (firstAudioAt === 0) firstAudioAt = Date.now();
-          const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
+        const value = rtmpResidueAccumulator.feed(rawValue);
+        if (value.byteLength === 0) continue;
 
-          if (!state.isBroadcasting && sustained) {
-            state.isBroadcasting = true;
-            stopSilence();
-            liveTransitionStartTime = Date.now();
-            isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
-            rtmpLog.info(rtmpLiveMsg);
+        state.lastSourceAudioTimeMs = Date.now();
+        state.totalBytesReceived += value.byteLength;
+        if (firstAudioAt === 0) firstAudioAt = Date.now();
+        const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
 
-            state.currentTrack = null;
-          }
-        } else {
-          firstAudioAt = 0; // Reiniciar conteo si hay un vacío de audio
+        if (!state.isBroadcasting && sustained) {
+          state.isBroadcasting = true;
+          stopSilence();
+          liveTransitionStartTime = Date.now();
+          isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
+          const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
+          rtmpLog.info(rtmpLiveMsg);
+
+          state.currentTrack = null;
         }
 
         if (state.isBroadcasting) {
@@ -1431,9 +1466,11 @@ export async function runRtmpListener() {
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
 
             const currentMusicDeck = activeDeck === "A" ? deckA : deckB;
-            const fallbackChunk = currentMusicDeck.historyBuffer.length > 0
-              ? currentMusicDeck.historyBuffer.pull(value.length)
-              : currentMusicDeck.buffer.pull(value.length);
+            const fallbackChunk = currentMusicDeck.buffer.length > 0
+              ? currentMusicDeck.buffer.pull(value.length)
+              : (currentMusicDeck.historyBuffer.length > 0
+                  ? currentMusicDeck.historyBuffer.pull(value.length)
+                  : new Uint8Array(value.length));
 
             // Equal-power crossfade live (mismo coste despreciable, solo durante transición)
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
@@ -1498,6 +1535,7 @@ export async function runRtmpListener() {
 // =============================================================
 export async function runSrtListener() {
   startMasterEncoder();
+  const srtResidueAccumulator = new PcmResidueAccumulator();
 
   const flapWindowMs = config.lowLatency ? 10000 : 30000;
   const flapMaxCount = config.lowLatency ? 5 : 3;
@@ -1550,36 +1588,39 @@ export async function runSrtListener() {
 
       let firstAudioAt = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value: rawValue } = await reader.read();
         if (done) break;
-        if (value.byteLength > 0) {
-          state.lastSourceAudioTimeMs = Date.now();
-          state.totalBytesReceived += value.byteLength;
-          if (firstAudioAt === 0) {
-            firstAudioAt = Date.now();
-            rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
-          }
-          const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
-          if (!state.isBroadcasting && sustained) {
-            state.isBroadcasting = true;
-            stopSilence();
-            liveTransitionStartTime = Date.now();
-            isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
-            rtmpLog.info(liveMsg);
-            state.currentTrack = null;
-          }
-        } else {
-          firstAudioAt = 0;
+
+        const value = srtResidueAccumulator.feed(rawValue);
+        if (value.byteLength === 0) continue;
+
+        state.lastSourceAudioTimeMs = Date.now();
+        state.totalBytesReceived += value.byteLength;
+        if (firstAudioAt === 0) {
+          firstAudioAt = Date.now();
+          rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
         }
+        const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
+        if (!state.isBroadcasting && sustained) {
+          state.isBroadcasting = true;
+          stopSilence();
+          liveTransitionStartTime = Date.now();
+          isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
+          const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
+          rtmpLog.info(liveMsg);
+          state.currentTrack = null;
+        }
+
         if (state.isBroadcasting) {
           if (isLiveTransitionActive) {
             const elapsed = Date.now() - liveTransitionStartTime;
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
             const curDeck = activeDeck === "A" ? deckA : deckB;
-            const fbChunk = curDeck.historyBuffer.length > 0
-              ? curDeck.historyBuffer.pull(value.length)
-              : curDeck.buffer.pull(value.length);
+            const fbChunk = curDeck.buffer.length > 0
+              ? curDeck.buffer.pull(value.length)
+              : (curDeck.historyBuffer.length > 0
+                  ? curDeck.historyBuffer.pull(value.length)
+                  : new Uint8Array(value.length));
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
             const volFb = Math.cos(progress * Math.PI * 0.5);
             const mixed = mixSamples(value, volLive, fbChunk, volFb);

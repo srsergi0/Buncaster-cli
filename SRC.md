@@ -6,7 +6,7 @@
 import fs from "fs";
 import { config } from "./config";
 import { rtmpLog } from "./logger";
-import { state } from "./state";
+import { state, type DeckState } from "./state";
 import { broadcast, broadcastOpus } from "./broadcaster";
 import { bitrateDetector } from "./bitrate-detector";
 import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
@@ -16,16 +16,45 @@ import { FORMAT_CONFIG } from "./format-config";
 export let opusHeaders: Uint8Array | null = null;
 
 // =============================================================
-// 1. CLASE BUFFER FIFO DE AUDIO PCM
+// 1. CLASE BUFFER FIFO DE AUDIO PCM & ACUMULADOR DE RESIDUOS
 // =============================================================
-// Diseño "cero allocaciones": un deck secundario solo necesita la
-// ventana de crossfade de audio bufferizada (el resto de la canción se
-// descarta al llenarse el FIFO). Antes se bufferizaba la canción
-// completa (~46MB por tema a 192KB/s) y esa memoria quedaba retenida
-// hasta que el deck moría. pullInto() escribe en un buffer del pool PCM
-// (reutilizable) en vez de alocar uno nuevo por chunk.
-// 192KB/s = 48000Hz × 2ch × 2bytes.
-const DECK_BUFFER_CAP_BYTES = (config.crossfadeSeconds + 1) * 192_000;
+export class PcmResidueAccumulator {
+  private residue: Uint8Array = new Uint8Array(0);
+
+  /**
+   * Asegura que solo se entreguen frames completos de 4 bytes (stereo 16-bit).
+   * Retiene 1-3 bytes remanentes en memoria para unirlos con el siguiente chunk.
+   */
+  feed(chunk: Uint8Array): Uint8Array {
+    let combined: Uint8Array;
+    if (this.residue.length > 0) {
+      combined = new Uint8Array(this.residue.length + chunk.length);
+      combined.set(this.residue, 0);
+      combined.set(chunk, this.residue.length);
+    } else {
+      combined = chunk;
+    }
+
+    const frameBytes = 4;
+    const alignedLength = Math.floor(combined.length / frameBytes) * frameBytes;
+    const remainder = combined.length - alignedLength;
+
+    if (remainder > 0) {
+      this.residue = combined.slice(alignedLength);
+    } else {
+      this.residue = new Uint8Array(0);
+    }
+
+    if (alignedLength === 0) return new Uint8Array(0);
+    return combined.subarray(0, alignedLength);
+  }
+
+  reset() {
+    this.residue = new Uint8Array(0);
+  }
+}
+
+const DECK_BUFFER_CAP_BYTES = Math.max(384_000, Math.round((config.crossfadeSeconds + 1) * 192_000));
 class AudioStreamBuffer {
   private queue: Uint8Array[] = [];
   private totalBytes = 0;
@@ -36,6 +65,7 @@ class AudioStreamBuffer {
   }
 
   push(chunk: Uint8Array) {
+    if (chunk.byteLength === 0) return;
     this.queue.push(chunk);
     this.totalBytes += chunk.byteLength;
     if (this.maxBytes > 0) {
@@ -83,27 +113,45 @@ class AudioStreamBuffer {
 }
 
 // =============================================================
-// 2. ESTRUCTURA DE DECKS (REPRODUCTORES DE AUDIO)
+// 2. ESTRUCTURA DE DECKS CON MÁQUINA DE ESTADOS Y SESIÓN
 // =============================================================
-interface Deck {
+export interface Deck {
   id: "A" | "B";
+  state: DeckState;
+  sessionId: string;
+  generation: number;
   buffer: AudioStreamBuffer;
+  historyBuffer: AudioStreamBuffer;
+  residueAcc: PcmResidueAccumulator;
   process: any | null;
   currentTrackFile: string | null;
+  pendingTrackMeta: { file: string; title: string; artist: string; duration: number } | null;
 }
 
 export const deckA: Deck = {
   id: "A",
-  buffer: new AudioStreamBuffer(),
+  state: "IDLE",
+  sessionId: "",
+  generation: 0,
+  buffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  historyBuffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  residueAcc: new PcmResidueAccumulator(),
   process: null,
   currentTrackFile: null,
+  pendingTrackMeta: null,
 };
 
 export const deckB: Deck = {
   id: "B",
-  buffer: new AudioStreamBuffer(),
+  state: "IDLE",
+  sessionId: "",
+  generation: 0,
+  buffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  historyBuffer: new AudioStreamBuffer(DECK_BUFFER_CAP_BYTES),
+  residueAcc: new PcmResidueAccumulator(),
   process: null,
   currentTrackFile: null,
+  pendingTrackMeta: null,
 };
 
 export let fallbackPlaylist: string[] = [];
@@ -204,7 +252,7 @@ function persistMetaCache() {
 }
 
 // =============================================================
-// 5. MEZCLADORES MATEMÁTICOS DE PCM (TypedArrays)
+// 5. MEZCLADORES MATEMÁTICOS DE PCM (TypedArrays con Limitador Suave)
 // =============================================================
 function mixSamples(chunkA: Uint8Array, volA: number, chunkB: Uint8Array, volB: number): Uint8Array {
   const samplesA = new Int16Array(chunkA.buffer, chunkA.byteOffset, chunkA.byteLength / 2);
@@ -215,22 +263,36 @@ function mixSamples(chunkA: Uint8Array, volA: number, chunkB: Uint8Array, volB: 
   const outBuffer = acquirePcmBuffer(byteLength);
   const outSamples = new Int16Array(outBuffer, 0, length);
 
-  // Recorrer la parte solapada sin chequeo de undefined (fast path)
   const minLen = Math.min(samplesA.length, samplesB.length);
+  const THRESHOLD = 28000;
+  const CEILING = 32767;
+  const RANGE = CEILING - THRESHOLD;
+
+  // Soft-knee limiter: evita distorsión digital dura (clipping) al sumar pistas
   for (let i = 0; i < minLen; i++) {
-    let mixed = (samplesA[i]! * volA) + (samplesB[i]! * volB);
-    if (mixed > 32767) mixed = 32767;
-    else if (mixed < -32768) mixed = -32768;
-    outSamples[i] = mixed;
+    const mixed = (samplesA[i]! * volA) + (samplesB[i]! * volB);
+    const abs = Math.abs(mixed);
+    let val: number;
+    if (abs <= THRESHOLD) {
+      val = mixed;
+    } else {
+      const over = abs - THRESHOLD;
+      const compressed = THRESHOLD + RANGE * Math.tanh(over / RANGE);
+      val = Math.sign(mixed) * compressed;
+    }
+    outSamples[i] = Math.max(-32768, Math.min(32767, Math.round(val)));
   }
+
   // Cola del stream más largo (sin mezclar, solo volumen)
   if (samplesA.length > minLen) {
     for (let i = minLen; i < length; i++) {
-      outSamples[i] = samplesA[i]! * volA;
+      const scaled = Math.round(samplesA[i]! * volA);
+      outSamples[i] = Math.max(-32768, Math.min(32767, scaled));
     }
   } else if (samplesB.length > minLen) {
     for (let i = minLen; i < length; i++) {
-      outSamples[i] = samplesB[i]! * volB;
+      const scaled = Math.round(samplesB[i]! * volB);
+      outSamples[i] = Math.max(-32768, Math.min(32767, scaled));
     }
   }
 
@@ -254,6 +316,15 @@ function applyVolume(chunk: Uint8Array, volume: number): Uint8Array {
 }
 
 function writeToMaster(chunk: Uint8Array) {
+  if (chunk.byteLength === 0) return;
+
+  state.lastPcmSampleTimeMs = Date.now();
+
+  // Actualizar métricas del reloj multimedia basado en muestras (1 frame = 4 bytes stereo s16le)
+  const frames = Math.floor(chunk.byteLength / 4);
+  state.audioClockSamples += frames;
+  state.audioSamplesProduced += frames;
+
   // Opus tier - siempre escribe PCM crudo (o procesado) al encoder opus si está habilitado
   // Se hace primero para que opus tenga loudnorm vía ffmpeg -af si audioProcessing
   if (config.opusTierEnabled && state.opusProcess?.stdin) {
@@ -466,7 +537,16 @@ function pollForChanges() {
  * y ajusta el índice actual para no perder la posición.
  */
 function rescanPlaylist() {
-  if (!config.fallbackSource || !isPlaylistInitialized) return;
+  if (!config.fallbackSource) return;
+
+  if (!isPlaylistInitialized) {
+    initializeFallbackSource();
+    if (fallbackPlaylist.length > 0 && !state.isBroadcasting) {
+      stopSilence();
+      startFallback();
+    }
+    return;
+  }
 
   try {
     const stat = fs.statSync(config.fallbackSource);
@@ -519,6 +599,12 @@ function rescanPlaylist() {
     rtmpLog.debug(
       `[Playlist Watch] Playlist rebuilt: ${removed.length} removed, ${added.length} added. Total: ${fallbackPlaylist.length} tracks.`,
     );
+
+    // Si estábamos reproduciendo silencio porque la carpeta arrancó vacía, arrancar música inmediatamente
+    if (silenceInterval && fallbackPlaylist.length > 0 && !state.isBroadcasting) {
+      stopSilence();
+      startFallback();
+    }
   } catch (err) {
     rtmpLog.debug(`[Playlist Watch] Error rescanning folder: ${(err as Error).message}`);
   }
@@ -584,7 +670,101 @@ export function stopPlaylistWatcher() {
   rtmpLog.debug("[Playlist Watch] Watcher and polling stopped.");
 }
 
+// =============================================================
+// SUBPROCESS STDERR DRAINING & AUDIO WATCHDOG
+// =============================================================
+export function drainProcessStderr(proc: any, name: string): void {
+  if (!proc?.stderr) return;
+  const reader = proc.stderr.getReader();
+  const decoder = new TextDecoder();
+  const tail: string[] = [];
+  const MAX_TAIL = 10;
+
+  (async () => {
+    let remainder = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        const text = remainder + decoder.decode(value, { stream: true });
+        const lines = text.split("\n");
+        remainder = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          tail.push(trimmed);
+          if (tail.length > MAX_TAIL) tail.shift();
+        }
+      }
+    } catch {
+      // stream cerrado o terminado
+    } finally {
+      try { reader.cancel(); } catch {}
+    }
+  })();
+
+  if (proc.exited) {
+    proc.exited.then((exitCode: number) => {
+      if (exitCode !== 0 && tail.length > 0) {
+        rtmpLog.warn(`[Subprocess ${name}] exited with code ${exitCode}. Stderr tail:\n${tail.map((l) => `  [${name}] ${l}`).join("\n")}`);
+      }
+    }).catch(() => {});
+  }
+}
+
+export function checkAudioWatchdog(now = Date.now()): boolean {
+  if (!state.isBroadcasting) return false;
+  if (!state.sourceConnected) return false;
+  if (state.lastSourceAudioTimeMs === 0) return false;
+
+  const silenceDurationMs = now - state.lastSourceAudioTimeMs;
+  if (silenceDurationMs > 2500) {
+    rtmpLog.warn(`[Audio Watchdog] Frozen live audio detected (${silenceDurationMs}ms with zero frames). Forcing failover to fallback.`);
+    state.audioUnderruns++;
+    state.isBroadcasting = false;
+    state.sourceConnected = false;
+    state.lastSourceAudioTimeMs = 0;
+
+    if (state.sourceProcess) {
+      try {
+        state.sourceProcess.kill();
+      } catch {
+        /* noop */
+      }
+      state.sourceProcess = null;
+    }
+
+    startFallback();
+    return true;
+  }
+  return false;
+}
+
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+export function startAudioWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    if (state.shuttingDown) {
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+      return;
+    }
+    checkAudioWatchdog();
+  }, 1000);
+}
+
+export function stopAudioWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+}
+
 export function startMasterEncoder() {
+  startAudioWatchdog();
   if (state.masterProcess || nativeEncoder) {
     if (config.opusTierEnabled && !state.opusProcess) startOpusEncoder();
     return;
@@ -645,6 +825,7 @@ function startFfmpegMasterEncoder() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(state.masterProcess, "MasterEncoder");
 
     const reader = state.masterProcess.stdout.getReader();
     
@@ -715,6 +896,7 @@ export function startOpusEncoder() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(state.opusProcess, "OpusEncoder");
     const reader = state.opusProcess.stdout.getReader();
     const proc = state.opusProcess;
     proc.exited.then((code: number) => {
@@ -730,6 +912,32 @@ export function startOpusEncoder() {
   }
 }
 
+export function extractOggOpusHeaders(buf: Uint8Array): Uint8Array | null {
+  let offset = 0;
+  let pagesFound = 0;
+  while (offset + 27 <= buf.length) {
+    if (buf[offset] !== 0x4f || buf[offset + 1] !== 0x67 || buf[offset + 2] !== 0x67 || buf[offset + 3] !== 0x73) {
+      break;
+    }
+    const numSegments = buf[offset + 26]!;
+    if (offset + 27 + numSegments > buf.length) break;
+
+    let payloadLen = 0;
+    for (let i = 0; i < numSegments; i++) {
+      payloadLen += buf[offset + 27 + i]!;
+    }
+    const pageLen = 27 + numSegments + payloadLen;
+    if (offset + pageLen > buf.length) break;
+
+    pagesFound++;
+    offset += pageLen;
+    if (pagesFound === 2) {
+      return buf.slice(0, offset);
+    }
+  }
+  return null;
+}
+
 let opusPackets = 0;
 let opusBytesTotal = 0;
 async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
@@ -740,19 +948,18 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
         rtmpLog.debug("Opus stream closed");
         break;
       }
-      // Captura headers OpusHead/OpusTags (primer chunk contiene OggS + OpusHead)
+      // Captura cabeceras OpusHead/OpusTags con parsing exacto de páginas Ogg
       if (!opusHeaders) {
-        const text = new TextDecoder().decode(value.subarray(0, Math.min(value.length, 200)));
-        if (text.includes("OpusHead")) {
-          // Guarda todo el primer chunk como headers (contiene ambas cabeceras)
-          opusHeaders = value.slice();
-          rtmpLog.debug(`[Opus Tier] headers captured ${opusHeaders.length}B`);
-          rtmpLog.debug(`[Opus Debug] headers hex ${Array.from(value.subarray(0,32)).map(b=>b.toString(16).padStart(2,"0")).join(" ")}`);
-        } else if (value.length < 8192) {
-          // Primer chunk pequeño sin OpusHead aún, acumular? Por ahora guarda primer chunk
-          // No debería pasar, pero por seguridad guarda primer chunk
-          opusHeaders = value.slice();
-          rtmpLog.debug(`[Opus Tier] headers (fallback) ${opusHeaders.length}B`);
+        const exactHeaders = extractOggOpusHeaders(value);
+        if (exactHeaders) {
+          opusHeaders = exactHeaders;
+          rtmpLog.debug(`[Opus Tier] Exact Ogg/Opus header pages captured: ${opusHeaders.length}B`);
+        } else {
+          const text = new TextDecoder().decode(value.subarray(0, Math.min(value.length, 200)));
+          if (text.includes("OpusHead")) {
+            opusHeaders = value.slice();
+            rtmpLog.debug(`[Opus Tier] headers captured (fallback) ${opusHeaders.length}B`);
+          }
         }
       }
       opusPackets++;
@@ -775,6 +982,8 @@ export function stopOpusEncoder() {
     state.opusProcess.kill();
   } catch {}
   state.opusProcess = null;
+  opusHeaders = null;
+  preBufferOpus.reset();
 }
 
 export function stopMasterEncoder() {
@@ -876,7 +1085,6 @@ export function startFallback() {
     fileToPlay = state.fallbackQueue.shift()!;
   } else {
     if (fallbackPlaylist.length === 0) {
-      // already logged friendly message in initializeFallbackSource / startSilence
       rtmpLog.debug("Fallback playlist empty — silence");
       startSilence();
       return;
@@ -890,19 +1098,44 @@ export function startFallback() {
     }
   }
 
-  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
-  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track: ${cleanName}`);
+  // Generar nueva sesión e incrementar generación para invalidar callbacks previos
+  currentDeck.generation++;
+  currentDeck.sessionId = `${currentDeck.id}-${currentDeck.generation}-${Date.now()}`;
+  currentDeck.state = "PRELOADING";
+  state.deckState[currentDeck.id] = currentDeck.state;
+  state.deckSessions[currentDeck.id] = currentDeck.sessionId;
+  state.deckGenerations[currentDeck.id] = currentDeck.generation;
+  const session = currentDeck.sessionId;
 
   currentDeck.currentTrackFile = fileToPlay;
+  currentDeck.pendingTrackMeta = null;
+  currentDeck.buffer.clear();
+  currentDeck.residueAcc.reset();
+
+  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
+  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track (Session ${session}): ${cleanName}`);
 
   getFileMetadata(fileToPlay).then((meta) => {
-    state.currentTrack = {
+    if (currentDeck.sessionId !== session) return; // Callback obsoleto ignorado
+
+    currentDeck.pendingTrackMeta = {
       file: fileToPlay,
       title: meta.title || cleanName.replace(/\.[^/.]+$/, ""),
       artist: meta.artist || "Artista Desconocido",
       duration: meta.duration,
-      startedAt: Date.now(),
     };
+
+    // Si el deck ya empezó a sonar en el master, activar metadatos de inmediato
+    if (currentDeck.state === "PLAYING" && activeDeck === currentDeck.id) {
+      state.currentTrack = {
+        file: fileToPlay,
+        title: currentDeck.pendingTrackMeta.title,
+        artist: currentDeck.pendingTrackMeta.artist,
+        duration: currentDeck.pendingTrackMeta.duration,
+        startedAt: Date.now(),
+      };
+      currentDeck.pendingTrackMeta = null;
+    }
   });
 
   const args = [
@@ -922,23 +1155,24 @@ export function startFallback() {
       stdout: "pipe",
       stderr: "pipe",
     });
+    drainProcessStderr(currentDeck.process, `Deck-${currentDeck.id}`);
 
     const reader = currentDeck.process.stdout.getReader();
-    pipeFallback(currentDeck, reader);
+    pipeFallback(currentDeck, reader, session);
   } catch (err) {
     rtmpLog.debug(`Error starting FFmpeg on Deck ${currentDeck.id}: ${(err as Error).message}`);
   }
 }
 
 // =============================================================
-// 4. BUCLE DE INGESTA DE FALLBACK (RELOJ CONDUCIDO POR EVENTOS)
+// 4. BUCLE DE INGESTA DE FALLBACK CON MÁQUINA DE ESTADOS
 // =============================================================
-async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint8Array>) {
+async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint8Array>, session: string) {
   const processInstance = deck.process;
   if (processInstance) {
     processInstance.exited.then((exitCode: number) => {
-      if (deck.process === processInstance && !transitionStarted) {
-        rtmpLog.debug(`[Deck ${deck.id}] Process ended (exitCode: ${exitCode}).`);
+      if (deck.process === processInstance && deck.sessionId === session && !transitionStarted) {
+        rtmpLog.debug(`[Deck ${deck.id}] Process ended (Session ${session}, exitCode: ${exitCode}).`);
         try {
           reader.cancel();
         } catch {
@@ -953,53 +1187,98 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
       const { done, value } = await reader.read();
       if (done) break;
 
-      // Si este deck es el secundario, simplemente almacenamos en búfer y no escribimos al maestro.
-      // El deck primario (reloj) consumirá este búfer en sus fundidos.
+      // Si la sesión fue sustituida o descartada, detener consumo
+      if (deck.sessionId !== session) break;
+
+      // Ensamblador de residuos PCM: garantiza frames completos de 4 bytes estéreo
+      const aligned = deck.residueAcc.feed(value);
+      if (aligned.length === 0) continue;
+
+      // Si este deck es el secundario, precarga su FIFO para el futuro crossfade
       if (activeDeck !== deck.id) {
-        deck.buffer.push(value);
+        deck.state = "PRELOADING";
+        state.deckState[deck.id] = deck.state;
+        deck.buffer.push(aligned);
         continue;
       }
+
+      // Deck activo: marcar PLAYING y sincronizar metadatos en el momento de emisión
+      if (deck.state !== "PLAYING" && !transitionStarted) {
+        deck.state = "PLAYING";
+        state.deckState[deck.id] = deck.state;
+        if (deck.pendingTrackMeta) {
+          state.currentTrack = {
+            file: deck.pendingTrackMeta.file,
+            title: deck.pendingTrackMeta.title,
+            artist: deck.pendingTrackMeta.artist,
+            duration: deck.pendingTrackMeta.duration,
+            startedAt: Date.now(),
+          };
+          deck.pendingTrackMeta = null;
+        }
+      }
+
+      // Retener en historyBuffer para permitir crossfade real cuando entra Live RTMP/SRT
+      deck.historyBuffer.push(aligned);
 
       // Si este deck es el primario (conductor del reloj de ingesta):
       if (!state.isBroadcasting) {
         if (transitionStarted) {
-          // Fundido cruzado activo entre Deck A y Deck B
+          deck.state = "CROSSFADING";
+          state.deckState[deck.id] = deck.state;
           const elapsed = Date.now() - crossfadeStartTime;
           const progress = Math.min(1.0, elapsed / (config.crossfadeSeconds * 1000));
           
-          // Equal-power crossfade (cosine) - potencia constante, evita dip -3dB de linear y pico por ganancia
-          // Solo se ejecuta durante ~2s, coste extra ~2x cos por chunk (~48Hz) despreciable
+          // Equal-power crossfade (cosine)
           const volOut = Math.cos(progress * Math.PI * 0.5);
           const volIn = Math.cos((1 - progress) * Math.PI * 0.5);
 
           const nextDeck = deck.id === "A" ? deckB : deckA;
-          const otherChunk = nextDeck.buffer.pull(value.length);
-          const mixed = mixSamples(value, volOut, otherChunk, volIn);
+          const otherChunk = nextDeck.buffer.pull(aligned.length);
+          const mixed = mixSamples(aligned, volOut, otherChunk, volIn);
 
           writeToMaster(mixed);
 
           if (progress >= 1.0) {
             transitionStarted = false;
-            // Detener el deck saliente (este deck)
             const oldDeck = deck;
+            oldDeck.state = "DRAINING";
+            state.deckState[oldDeck.id] = oldDeck.state;
+
             activeDeck = nextDeck.id; // El nuevo deck pasa a ser el primario
+            nextDeck.state = "PLAYING";
+            state.deckState[nextDeck.id] = nextDeck.state;
+
+            // Sincronizar metadatos de la nueva canción justo al completar el relevo
+            if (nextDeck.pendingTrackMeta) {
+              state.currentTrack = {
+                file: nextDeck.pendingTrackMeta.file,
+                title: nextDeck.pendingTrackMeta.title,
+                artist: nextDeck.pendingTrackMeta.artist,
+                duration: nextDeck.pendingTrackMeta.duration,
+                startedAt: Date.now(),
+              };
+              nextDeck.pendingTrackMeta = null;
+            }
             
             setTimeout(() => {
-              if (oldDeck.process) {
+              if (oldDeck.process && oldDeck.sessionId === session) {
                 try { oldDeck.process.kill(); } catch {}
                 oldDeck.process = null;
                 oldDeck.currentTrackFile = null;
                 oldDeck.buffer.clear();
+                oldDeck.state = "STOPPED";
+                state.deckState[oldDeck.id] = oldDeck.state;
               }
             }, 50);
           }
         } else if (isFallbackFadeInActive) {
-          // Fundido de entrada suave (después de desconexión de OBS) - low-latency usa 0.2s
+          // Fundido de entrada suave (después de desconexión de OBS)
           const fadeSec = config.lowLatency ? config.crossfadeLiveSeconds : config.crossfadeSeconds;
           const elapsed = Date.now() - fallbackFadeInStartTime;
           const progress = Math.min(1.0, elapsed / (fadeSec * 1000));
 
-          const faded = applyVolume(value, progress);
+          const faded = applyVolume(aligned, progress);
           writeToMaster(faded);
 
           if (progress >= 1.0) {
@@ -1007,7 +1286,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
           }
         } else {
           // Reproducción normal al 100% de volumen
-          writeToMaster(value);
+          writeToMaster(aligned);
 
           // Monitorear final de tema para disparar crossfade
           if (state.currentTrack && state.currentTrack.duration > 0) {
@@ -1027,29 +1306,33 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
       }
     }
   } catch (err) {
-    if (!isStoppingFallback) {
+    if (!isStoppingFallback && deck.sessionId === session) {
       rtmpLog.debug(`Error reading Deck stream ${deck.id}: ${(err as Error).message}`);
     }
   } finally {
-    const wasIntentionallyStopped = deck.process === null;
-    deck.process = null;
-    deck.currentTrackFile = null;
-    deck.buffer.clear();
+    if (deck.sessionId === session) {
+      const wasIntentionallyStopped = deck.process === null;
+      deck.process = null;
+      deck.currentTrackFile = null;
+      deck.buffer.clear();
+      deck.state = "STOPPED";
+      state.deckState[deck.id] = deck.state;
 
-    if (!state.isBroadcasting && !state.shuttingDown && !wasIntentionallyStopped) {
-      if (activeDeck === deck.id && !transitionStarted) {
-        // Caso normal: deck terminó sin crossfade activo
-        activeDeck = activeDeck === "A" ? "B" : "A";
-        startFallback();
-      } else if (activeDeck === deck.id && transitionStarted) {
-        // FIX: Deck terminó durante un crossfade — completar la transición
-        rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
-        transitionStarted = false;
-        activeDeck = deck.id === "A" ? "B" : "A";
-        const newDeck = activeDeck === "A" ? deckA : deckB;
-        newDeck.buffer.clear();
-        if (!newDeck.process) {
+      if (!state.isBroadcasting && !state.shuttingDown && !wasIntentionallyStopped) {
+        if (activeDeck === deck.id && !transitionStarted) {
+          // Caso normal: deck terminó sin crossfade activo
+          activeDeck = activeDeck === "A" ? "B" : "A";
           startFallback();
+        } else if (activeDeck === deck.id && transitionStarted) {
+          // Deck terminó durante un crossfade — completar la transición
+          rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
+          transitionStarted = false;
+          activeDeck = deck.id === "A" ? "B" : "A";
+          const newDeck = activeDeck === "A" ? deckA : deckB;
+          newDeck.buffer.clear();
+          if (!newDeck.process) {
+            startFallback();
+          }
         }
       }
     }
@@ -1068,9 +1351,15 @@ export function stopFallback() {
   }
   deckA.buffer.clear();
   deckB.buffer.clear();
-  
+  deckA.historyBuffer.clear();
+  deckB.historyBuffer.clear();
+  deckA.state = "STOPPED";
+  deckB.state = "STOPPED";
+  state.deckState.A = "STOPPED";
+  state.deckState.B = "STOPPED";
+  deckA.currentTrackFile = null;
+  deckB.currentTrackFile = null;
   state.currentTrack = null;
-  
   isStoppingFallback = false;
 }
 
@@ -1093,6 +1382,7 @@ export function actionSkipFallback() {
 // =============================================================
 export async function runRtmpListener() {
   startMasterEncoder();
+  const rtmpResidueAccumulator = new PcmResidueAccumulator();
 
   // Detección de flaps: si RTMP se desconecta muchas veces en poco tiempo,
   // se ignora la fuente durante un periodo de cooldown para no romper
@@ -1131,6 +1421,7 @@ export async function runRtmpListener() {
         stdout: "pipe",
         stderr: "pipe",
       });
+      drainProcessStderr(state.sourceProcess, "RTMP-Source");
 
       state.sourceConnected = true;
       const reader = state.sourceProcess.stdout.getReader();
@@ -1151,26 +1442,26 @@ export async function runRtmpListener() {
       // conexiones breves/sondas que provocan cortes en el respaldo.
       let firstAudioAt = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value: rawValue } = await reader.read();
         if (done) break;
 
-        if (value.byteLength > 0) {
-          state.totalBytesReceived += value.byteLength;
-          if (firstAudioAt === 0) firstAudioAt = Date.now();
-          const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
+        const value = rtmpResidueAccumulator.feed(rawValue);
+        if (value.byteLength === 0) continue;
 
-          if (!state.isBroadcasting && sustained) {
-            state.isBroadcasting = true;
-            stopSilence();
-            liveTransitionStartTime = Date.now();
-            isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
-            rtmpLog.info(rtmpLiveMsg);
+        state.lastSourceAudioTimeMs = Date.now();
+        state.totalBytesReceived += value.byteLength;
+        if (firstAudioAt === 0) firstAudioAt = Date.now();
+        const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
 
-            state.currentTrack = null;
-          }
-        } else {
-          firstAudioAt = 0; // Reiniciar conteo si hay un vacío de audio
+        if (!state.isBroadcasting && sustained) {
+          state.isBroadcasting = true;
+          stopSilence();
+          liveTransitionStartTime = Date.now();
+          isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
+          const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
+          rtmpLog.info(rtmpLiveMsg);
+
+          state.currentTrack = null;
         }
 
         if (state.isBroadcasting) {
@@ -1180,7 +1471,11 @@ export async function runRtmpListener() {
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
 
             const currentMusicDeck = activeDeck === "A" ? deckA : deckB;
-            const fallbackChunk = currentMusicDeck.buffer.pull(value.length);
+            const fallbackChunk = currentMusicDeck.buffer.length > 0
+              ? currentMusicDeck.buffer.pull(value.length)
+              : (currentMusicDeck.historyBuffer.length > 0
+                  ? currentMusicDeck.historyBuffer.pull(value.length)
+                  : new Uint8Array(value.length));
 
             // Equal-power crossfade live (mismo coste despreciable, solo durante transición)
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
@@ -1245,6 +1540,7 @@ export async function runRtmpListener() {
 // =============================================================
 export async function runSrtListener() {
   startMasterEncoder();
+  const srtResidueAccumulator = new PcmResidueAccumulator();
 
   const flapWindowMs = config.lowLatency ? 10000 : 30000;
   const flapMaxCount = config.lowLatency ? 5 : 3;
@@ -1281,6 +1577,7 @@ export async function runSrtListener() {
         stdout: "pipe",
         stderr: "pipe",
       });
+      drainProcessStderr(state.sourceProcess, "SRT-Source");
 
       state.sourceConnected = true;
       const reader = state.sourceProcess.stdout.getReader();
@@ -1296,33 +1593,39 @@ export async function runSrtListener() {
 
       let firstAudioAt = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value: rawValue } = await reader.read();
         if (done) break;
-        if (value.byteLength > 0) {
-          state.totalBytesReceived += value.byteLength;
-          if (firstAudioAt === 0) {
-            firstAudioAt = Date.now();
-            rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
-          }
-          const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
-          if (!state.isBroadcasting && sustained) {
-            state.isBroadcasting = true;
-            stopSilence();
-            liveTransitionStartTime = Date.now();
-            isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
-            const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
-            rtmpLog.info(liveMsg);
-            state.currentTrack = null;
-          }
-        } else {
-          firstAudioAt = 0;
+
+        const value = srtResidueAccumulator.feed(rawValue);
+        if (value.byteLength === 0) continue;
+
+        state.lastSourceAudioTimeMs = Date.now();
+        state.totalBytesReceived += value.byteLength;
+        if (firstAudioAt === 0) {
+          firstAudioAt = Date.now();
+          rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
         }
+        const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
+        if (!state.isBroadcasting && sustained) {
+          state.isBroadcasting = true;
+          stopSilence();
+          liveTransitionStartTime = Date.now();
+          isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
+          const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
+          rtmpLog.info(liveMsg);
+          state.currentTrack = null;
+        }
+
         if (state.isBroadcasting) {
           if (isLiveTransitionActive) {
             const elapsed = Date.now() - liveTransitionStartTime;
             const progress = Math.min(1.0, elapsed / (config.crossfadeLiveSeconds * 1000));
             const curDeck = activeDeck === "A" ? deckA : deckB;
-            const fbChunk = curDeck.buffer.pull(value.length);
+            const fbChunk = curDeck.buffer.length > 0
+              ? curDeck.buffer.pull(value.length)
+              : (curDeck.historyBuffer.length > 0
+                  ? curDeck.historyBuffer.pull(value.length)
+                  : new Uint8Array(value.length));
             const volLive = Math.cos((1 - progress) * Math.PI * 0.5);
             const volFb = Math.cos(progress * Math.PI * 0.5);
             const mixed = mixSamples(value, volLive, fbChunk, volFb);
@@ -1371,12 +1674,11 @@ export async function runSrtListener() {
 
 ```
 
----
-
 ## `src/bitrate-detector.ts`
 
 ```ts
 import { config } from "./config";
+import { state } from "./state";
 import { rtmpLog } from "./logger";
 
 export interface Mp3FrameInfo {
@@ -1472,12 +1774,12 @@ export class BitrateDetector {
   }
 }
 export const bitrateDetector = new BitrateDetector((info) => {
+  state.detectedBitrateKbps = info.bitrateKbps;
+  state.detectedSampleRate = info.sampleRate;
   rtmpLog.debug(`Detected real bitrate: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`);
 });
 
 ```
-
----
 
 ## `src/broadcaster.ts`
 
@@ -1492,13 +1794,28 @@ const MAX_SLOW_STRIKES = 5;
 export function evictClient(id: string, reason: string): void {
   const client = state.clients.get(id);
   if (!client) return;
+
   try {
     client.controller.close();
   } catch {
     /* noop */
   }
+
   state.clients.delete(id);
-  httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size}`);
+  state.mp3Clients.delete(id);
+  state.opusClients.delete(id);
+  state.listenersMp3 = state.mp3Clients.size;
+  state.listenersOpus = state.opusClients.size;
+
+  if (reason.includes("saturated") || reason.includes("backpressure")) {
+    state.evictionsTotal.backpressure++;
+  } else if (reason.includes("timeout")) {
+    state.evictionsTotal.timeout++;
+  } else {
+    state.evictionsTotal.slowClient++;
+  }
+
+  httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size} (mp3:${state.listenersMp3}, opus:${state.listenersOpus})`);
 }
 
 function getCurrentTitle(): string {
@@ -1508,27 +1825,36 @@ function getCurrentTitle(): string {
 }
 
 export function broadcast(chunk: Uint8Array): void {
-  preBuffer.push(chunk);
+  if (chunk.byteLength === 0) return;
 
-  for (const [id, client] of state.clients) {
-    if (client.tier !== "mp3") continue;
+  // Una sola copia inmutable administrada por el RingBuffer al publicar
+  const slot = preBuffer.push(chunk);
+  const data = slot ? slot.data : new Uint8Array(chunk);
+
+  if (state.mp3Clients.size === 0) return;
+
+  // Evaluar título una sola vez por chunk, no en cada cliente
+  const currentTitle = getCurrentTitle();
+
+  for (const [id, client] of state.mp3Clients) {
     try {
       if (client.icy) {
-        const pieces = chunkWithIcy(chunk, client.icy, getCurrentTitle());
+        const pieces = chunkWithIcy(data, client.icy, currentTitle);
         for (const piece of pieces) {
           client.controller.enqueue(piece);
         }
       } else {
-        client.controller.enqueue(chunk);
+        client.controller.enqueue(data);
       }
     } catch (err) {
       evictClient(id, `fallo al enviar datos: ${(err as Error).message}`);
       continue;
     }
 
-    client.bytesSent += chunk.byteLength;
-    state.totalBytesSent += chunk.byteLength;
+    client.bytesSent += data.byteLength;
+    state.totalBytesSent += data.byteLength;
 
+    // Contrapresión calculada en bytes reales (ByteLengthQueuingStrategy)
     const desiredSize = client.controller.desiredSize;
     if (desiredSize !== null && desiredSize < 0) {
       client.slowStrikes++;
@@ -1542,21 +1868,26 @@ export function broadcast(chunk: Uint8Array): void {
 }
 
 export function broadcastOpus(chunk: Uint8Array): void {
-  preBufferOpus.push(chunk);
+  if (chunk.byteLength === 0) return;
 
-  for (const [id, client] of state.clients) {
-    if (client.tier !== "opus") continue;
+  // Una sola copia inmutable administrada por el RingBuffer al publicar
+  const slot = preBufferOpus.push(chunk);
+  const data = slot ? slot.data : new Uint8Array(chunk);
+
+  if (state.opusClients.size === 0) return;
+
+  for (const [id, client] of state.opusClients) {
     try {
-      // Opus via Ogg no usa icy
-      client.controller.enqueue(chunk);
+      client.controller.enqueue(data);
     } catch (err) {
       evictClient(id, `fallo al enviar datos (opus): ${(err as Error).message}`);
       continue;
     }
 
-    client.bytesSent += chunk.byteLength;
-    state.totalBytesSentOpus += chunk.byteLength;
+    client.bytesSent += data.byteLength;
+    state.totalBytesSentOpus += data.byteLength;
 
+    // Contrapresión calculada en bytes reales
     const desiredSize = client.controller.desiredSize;
     if (desiredSize !== null && desiredSize < 0) {
       client.slowStrikes++;
@@ -1569,9 +1900,8 @@ export function broadcastOpus(chunk: Uint8Array): void {
   }
 }
 
-```
 
----
+```
 
 ## `src/cli.ts`
 
@@ -1730,8 +2060,6 @@ setInterval(() => {}, 1000);
 
 ```
 
----
-
 ## `src/config.ts`
 
 ```ts
@@ -1765,6 +2093,8 @@ export interface Config {
   opusTierEnabled: boolean;
   opusTierBitrateKbps: number;
   lowLatency: boolean;
+  adminUser: string;
+  adminPassword: string;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -1773,6 +2103,16 @@ function envInt(name: string, fallback: number): number {
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 0) {
     throw new Error(`Environment variable ${name} invalid: "${raw}" (expected a non-negative integer)`);
+  }
+  return n;
+}
+
+export function envFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (Number.isNaN(n) || n < 0) {
+    throw new Error(`Environment variable ${name} invalid: "${raw}" (expected a non-negative number)`);
   }
   return n;
 }
@@ -1830,8 +2170,8 @@ function loadConfig(): Config {
     fallbackBitrateKbps: envInt("STREAM_BITRATE_KBPS", 320),
     fallbackSource: process.env.FALLBACK_SOURCE !== undefined ? process.env.FALLBACK_SOURCE : "",
     audioProcessing: envBool("AUDIO_PROCESSING", false),
-    crossfadeSeconds: envInt("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
-    crossfadeLiveSeconds: envInt("CROSSFADE_LIVE_SECONDS", lowLatency ? 0.2 : 2),
+    crossfadeSeconds: envFloat("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
+    crossfadeLiveSeconds: envFloat("CROSSFADE_LIVE_SECONDS", lowLatency ? 0.2 : 2),
     rtmpStreamKey: rtmpKey,
     rtmpMinLiveSeconds: envInt("RTMP_MIN_LIVE_SECONDS", lowLatency ? 0 : 10),
     useNativeLame: (() => {
@@ -1848,6 +2188,8 @@ function loadConfig(): Config {
     opusTierEnabled: envBool("ENABLE_OPUS_TIER", true),
     opusTierBitrateKbps: envInt("OPUS_TIER_BITRATE_KBPS", 96),
     lowLatency,
+    adminUser: process.env.ADMIN_USER || "admin",
+    adminPassword: process.env.ADMIN_PASSWORD || "",
   };
 
   return cfg;
@@ -1856,8 +2198,6 @@ function loadConfig(): Config {
 export const config = loadConfig();
 
 ```
-
----
 
 ## `src/decode-ffi.ts`
 
@@ -2069,57 +2409,76 @@ function openTrack(path: string): TrackState {
   const S = symbols;
 
   const fmtBuf = new Uint8Array(8);
-  // Bun 1.3 no acepta strings en args FFI: ruta NUL-terminada como buffer
-  // (avformat la copia internamente, el buffer puede liberarse tras la llamada)
-  const pathBuf = new TextEncoder().encode(path + "\0");
-  let r = S.avformat_open_input(ptr(fmtBuf), ptr(pathBuf), null, null);
-  if (r < 0) throw new Error(`avformat_open_input falló (${r})`);
-  const fmtCtx = readPtr(ptr(fmtBuf));
-
-  r = S.avformat_find_stream_info(fmtCtx, null);
-  if (r < 0) throw new Error(`avformat_find_stream_info falló (${r})`);
-
-  const streams = readPtr(fmtCtx + AVFORMAT_STREAMS);
-  const decBuf = new Uint8Array(8);
-  const streamIdx = S.av_find_best_stream(fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, ptr(decBuf), null);
-  if (streamIdx < 0) throw new Error("archivo sin flujo de audio");
-  const decoder = readPtr(ptr(decBuf));
-
-  const avctx = S.avcodec_alloc_context3(decoder);
-  if (!avctx) throw new Error("avcodec_alloc_context3");
-
-  const streamPtr = readPtr(streams + streamIdx * 8);
-  const codecpar = readPtr(streamPtr + AVSTREAM_CODECPAR);
-  r = S.avcodec_parameters_to_context(avctx, codecpar);
-  if (r < 0) throw new Error(`avcodec_parameters_to_context falló (${r})`);
-  r = S.avcodec_open2(avctx, decoder, null);
-  if (r < 0) throw new Error(`avcodec_open2 falló (${r})`);
-
-  const inFmt = readI32(codecpar, CODEPAR_FORMAT);
-  const inRate = readI32(codecpar, CODEPAR_SAMPLE_RATE);
-  let inLayout = readI64(codecpar, CODEPAR_CHANNEL_LAYOUT);
-  if (!inLayout) {
-    inLayout = readI32(codecpar, CODEPAR_CHANNELS) === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
-  }
-
-  const swr = S.swr_alloc_set_opts(null, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 48000, inLayout, inFmt, inRate, 0, null);
-  if (!swr) throw new Error("swr_alloc_set_opts falló");
-  if (S.swr_init(swr) < 0) throw new Error("swr_init falló");
-
-  const frame = S.av_frame_alloc();
-  const pkt = S.av_packet_alloc();
-  if (!frame || !pkt) throw new Error("av_frame_alloc/av_packet_alloc falló");
-
   const ctxBuf = new Uint8Array(8);
   const swrBuf = new Uint8Array(8);
   const frameBuf = new Uint8Array(8);
   const pktBuf = new Uint8Array(8);
-  writePtr(ctxBuf, avctx);
-  writePtr(swrBuf, swr);
-  writePtr(frameBuf, frame);
-  writePtr(pktBuf, pkt);
 
-  return { fmtCtx, avctx, swr, frame, pkt, streamIdx, fmtBuf, ctxBuf, swrBuf, frameBuf, pktBuf, swrOutPtr: new Uint8Array(8) };
+  let fmtCtx = 0;
+  let avctx = 0;
+  let swr = 0;
+  let frame = 0;
+  let pkt = 0;
+
+  const cleanupPartial = () => {
+    if (swr) { writePtr(swrBuf, swr); try { S.swr_free(ptr(swrBuf)); } catch {} }
+    if (frame) { writePtr(frameBuf, frame); try { S.av_frame_free(ptr(frameBuf)); } catch {} }
+    if (pkt) { writePtr(pktBuf, pkt); try { S.av_packet_free(ptr(pktBuf)); } catch {} }
+    if (avctx) { writePtr(ctxBuf, avctx); try { S.avcodec_free_context(ptr(ctxBuf)); } catch {} }
+    if (fmtCtx) { writePtr(fmtBuf, fmtCtx); try { S.avformat_close_input(ptr(fmtBuf)); } catch {} }
+  };
+
+  try {
+    // Bun 1.3 no acepta strings en args FFI: ruta NUL-terminada como buffer
+    const pathBuf = new TextEncoder().encode(path + "\0");
+    let r = S.avformat_open_input(ptr(fmtBuf), ptr(pathBuf), null, null);
+    if (r < 0) throw new Error(`avformat_open_input falló (${r})`);
+    fmtCtx = readPtr(ptr(fmtBuf));
+
+    r = S.avformat_find_stream_info(fmtCtx, null);
+    if (r < 0) throw new Error(`avformat_find_stream_info falló (${r})`);
+
+    const streams = readPtr(fmtCtx + AVFORMAT_STREAMS);
+    const decBuf = new Uint8Array(8);
+    const streamIdx = S.av_find_best_stream(fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, ptr(decBuf), null);
+    if (streamIdx < 0) throw new Error("archivo sin flujo de audio");
+    const decoder = readPtr(ptr(decBuf));
+
+    avctx = S.avcodec_alloc_context3(decoder);
+    if (!avctx) throw new Error("avcodec_alloc_context3 falló");
+
+    const streamPtr = readPtr(streams + streamIdx * 8);
+    const codecpar = readPtr(streamPtr + AVSTREAM_CODECPAR);
+    r = S.avcodec_parameters_to_context(avctx, codecpar);
+    if (r < 0) throw new Error(`avcodec_parameters_to_context falló (${r})`);
+    r = S.avcodec_open2(avctx, decoder, null);
+    if (r < 0) throw new Error(`avcodec_open2 falló (${r})`);
+
+    const inFmt = readI32(codecpar, CODEPAR_FORMAT);
+    const inRate = readI32(codecpar, CODEPAR_SAMPLE_RATE);
+    let inLayout = readI64(codecpar, CODEPAR_CHANNEL_LAYOUT);
+    if (!inLayout) {
+      inLayout = readI32(codecpar, CODEPAR_CHANNELS) === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+    }
+
+    swr = S.swr_alloc_set_opts(null, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 48000, inLayout, inFmt, inRate, 0, null);
+    if (!swr) throw new Error("swr_alloc_set_opts falló");
+    if (S.swr_init(swr) < 0) throw new Error("swr_init falló");
+
+    frame = S.av_frame_alloc();
+    pkt = S.av_packet_alloc();
+    if (!frame || !pkt) throw new Error("av_frame_alloc/av_packet_alloc falló");
+
+    writePtr(ctxBuf, avctx);
+    writePtr(swrBuf, swr);
+    writePtr(frameBuf, frame);
+    writePtr(pktBuf, pkt);
+
+    return { fmtCtx, avctx, swr, frame, pkt, streamIdx, fmtBuf, ctxBuf, swrBuf, frameBuf, pktBuf, swrOutPtr: new Uint8Array(8) };
+  } catch (err) {
+    cleanupPartial();
+    throw err;
+  }
 }
 
 function closeTrack(st: TrackState) {
@@ -2183,7 +2542,10 @@ export class NativeDecoder {
           }
           return written;
         }
-        if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) continue;
+        if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) {
+          S.av_packet_unref(st.pkt);
+          continue;
+        }
         const sr = S.avcodec_send_packet(st.avctx, st.pkt);
         // avcodec_send_packet NO libera el paquete: sin av_packet_unref,
         // cada paquete (~192KB/s de audio comprimido) se fuga para siempre
@@ -2197,12 +2559,19 @@ export class NativeDecoder {
       const nbSamples = readI32(st.frame, AVFRAME_NB_SAMPLES);
       if (nbSamples <= 0) continue;
 
+      const remainingBytes = out.length - written;
+      const maxOutSamples = Math.floor(remainingBytes / 4);
+      if (maxOutSamples <= 0) {
+        S.av_frame_unref(st.frame);
+        break;
+      }
+
       writePtr(st.swrOutPtr, ptr(out) + written);
-      const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), 48000, st.frame, nbSamples);
+      const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), maxOutSamples, st.frame, nbSamples);
       S.av_frame_unref(st.frame); // liberar el búfer del frame decodificado
       if (outCount <= 0) continue;
       written += outCount * 4;
-      if (written >= out.length) break; // margen lleno: cortar (no debería pasar)
+      if (written >= out.length) break; // margen lleno
     }
     return written;
   }
@@ -2213,38 +2582,37 @@ export class NativeDecoder {
     let emittedBytes = 0;
     const t0 = performance.now();
 
-    while (!this.cancelled) {
-      // Pacing real-time (equivalente a -re): 192 B/ms, en slices de 50ms
-      // para que kill() responda en <50ms (antes esperaba hasta 1s el
-      // sleep completo, dejando un deck muerto escribiendo un chunk más).
-      const targetMs = emittedBytes / 192;
-      while (true) {
-        const wait = targetMs - (performance.now() - t0);
-        if (wait <= 0 || this.cancelled) break;
-        await Bun.sleep(Math.min(50, wait));
-      }
-      if (this.cancelled) break;
-      if (controller.desiredSize !== null && controller.desiredSize < -PCM_BYTES_PER_SECOND) {
-        await Bun.sleep(100); // consumidor lento: backoff simple
-        continue;
-      }
+    try {
+      while (!this.cancelled) {
+        // Pacing real-time (equivalente a -re): 192 B/ms, en slices de 50ms
+        const targetMs = emittedBytes / 192;
+        while (true) {
+          const wait = targetMs - (performance.now() - t0);
+          if (wait <= 0 || this.cancelled) break;
+          await Bun.sleep(Math.min(50, wait));
+        }
+        if (this.cancelled) break;
+        if (controller.desiredSize !== null && controller.desiredSize < -PCM_BYTES_PER_SECOND) {
+          await Bun.sleep(100); // consumidor lento: backoff simple
+          continue;
+        }
 
-      const n = this.fill(st, out, flushedState);
-      if (n <= 0) break; // EOF sin datos pendientes
+        const n = this.fill(st, out, flushedState);
+        if (n <= 0) break; // EOF sin datos pendientes
 
-      // Copia 1/s (allocación grande → mmap → el allocator la devuelve al OS)
-      const chunk = out.slice(0, n);
-      try {
-        controller.enqueue(chunk);
-      } catch {
-        break; // stream cancelado
+        const chunk = out.slice(0, n);
+        try {
+          controller.enqueue(chunk);
+        } catch {
+          break; // stream cancelado
+        }
+        emittedBytes += n;
+        if (n < PCM_BYTES_PER_SECOND) break; // chunk parcial = fin de pista
       }
-      emittedBytes += n;
-      if (n < PCM_BYTES_PER_SECOND) break; // chunk parcial = fin de pista
+    } finally {
+      try { controller.close(); } catch { /* noop */ }
+      closeTrack(st);
     }
-
-    try { controller.close(); } catch { /* noop */ }
-    closeTrack(st);
   }
 }
 
@@ -2257,8 +2625,6 @@ if (!loadMemcpy()) {
 }
 
 ```
-
----
 
 ## `src/format-config.ts`
 
@@ -2334,8 +2700,6 @@ export function validateFormat(format: StreamFormat): StreamFormat {
 
 ```
 
----
-
 ## `src/http-helpers.ts`
 
 ```ts
@@ -2356,10 +2720,41 @@ export function checkStreamKey(req: Request): boolean {
   return header.slice(7) === config.rtmpStreamKey;
 }
 
+export function checkAdminAuth(req: Request): boolean {
+  // Si no se configuró contraseña de admin, permitimos acceso en desarrollo/local
+  if (!config.adminPassword) return true;
+
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader) return false;
+
+  if (authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7) === config.rtmpStreamKey;
+  }
+
+  if (authHeader.startsWith("Basic ")) {
+    try {
+      const b64 = authHeader.slice(6).trim();
+      const decoded = atob(b64);
+      const colonIdx = decoded.indexOf(":");
+      if (colonIdx === -1) return false;
+      const user = decoded.slice(0, colonIdx);
+      const pass = decoded.slice(colonIdx + 1);
+      return user === config.adminUser && pass === config.adminPassword;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 export function unauthorized(): Response {
   return new Response("Unauthorized", {
     status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="Admin", Bearer realm="BunRadio"' },
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Admin", Bearer realm="BunRadio"',
+      ...corsHeaders(),
+    },
   });
 }
 
@@ -2370,8 +2765,6 @@ export function getClientIp(req: Request, server: Bun.Server<undefined>): string
 }
 
 ```
-
----
 
 ## `src/http-server.ts`
 
@@ -2386,6 +2779,7 @@ const STREAM_PATHS = new Set(["/mp3", "/opus"]);
 import {
   corsHeaders,
   checkStreamKey,
+  checkAdminAuth,
   unauthorized,
   getClientIp,
 } from "./http-helpers";
@@ -2396,12 +2790,16 @@ import {
   transitionStarted,
   isStoppingFallback,
   opusHeaders,
+  stopMasterEncoder,
+  stopPlaylistWatcher,
+  stopAudioWatchdog,
 } from "./audio-router";
+import { flushLogsSync } from "./logger";
 
 import { StreamableHttpTransport, InMemorySessionAdapter } from "mcp-lite";
 import { mcpServer } from "./mcp-server";
 import { FORMAT_CONFIG } from "./format-config";
-import { type IcyClientState, createIcyState } from "./icy-metadata";
+import { type IcyClientState, createIcyState, chunkWithIcy } from "./icy-metadata";
 
 const mcpSessionAdapter = new InMemorySessionAdapter({ maxEventBufferSize: 100 });
 const mcpTransport = new StreamableHttpTransport({
@@ -2439,10 +2837,40 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   throw new Error(`Failed to bind HTTP port ${port} after ${retries} tries`);
 }
 
+let appJsCache: string | null = null;
+let appJsBuilding: Promise<string> | null = null;
+
+async function getOrBuildAppJs(): Promise<string> {
+  if (appJsCache) return appJsCache;
+  if (appJsBuilding) return appJsBuilding;
+
+  appJsBuilding = (async () => {
+    try {
+      const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
+      if (!build.success || !build.outputs[0]) throw new Error("Build failed");
+      const js = await build.outputs[0].text();
+      appJsCache = js;
+      return js;
+    } finally {
+      appJsBuilding = null;
+    }
+  })();
+
+  return appJsBuilding;
+}
+
 // Store fetch handler for tryServe wrapper
 (globalThis as any).__bunServeFetch = async (req: Request, server: any) => {
   const url = new URL(req.url);
   const path = url.pathname;
+
+  // Aislamiento del puerto de salida: si config.outputPort !== config.dashboardPort y la petición viene por outputServer,
+  // restringir estrictamente a streams de audio y endpoints de lectura de estado.
+  if (server?.port === config.outputPort && config.outputPort !== config.dashboardPort) {
+    if (!STREAM_PATHS.has(path) && path !== "/health" && path !== "/status" && path !== "/metrics") {
+      return Response.json({ error: "Not Found on Stream Port" }, { status: 404, headers: corsHeaders() });
+    }
+  }
 
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders() });
@@ -2465,7 +2893,13 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   // ---- Stream (literal /mp3 and /opus) ----
   if (STREAM_PATHS.has(path) && (req.method === "GET" || req.method === "HEAD")) {
     if (state.clients.size >= config.maxListeners) {
-      return new Response("Server at max listeners", { status: 503, headers: corsHeaders() });
+      return new Response("Server at max listeners", {
+        status: 503,
+        headers: {
+          "Retry-After": "5",
+          ...corsHeaders(),
+        },
+      });
     }
 
     const isOpus = path === "/opus";
@@ -2507,19 +2941,57 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
         if (isOpus && opusHeaders) { try { controller.enqueue(opusHeaders); } catch {} }
         const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
         if (shouldSendPreBuffer) {
-          for (const chunk of chosenPreBuffer.snapshot()) { try { controller.enqueue(chunk); } catch {} }
+          const currentTitle = state.currentTrack
+            ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
+            : "";
+          for (const chunk of chosenPreBuffer.snapshot()) {
+            try {
+              if (icyState) {
+                const pieces = chunkWithIcy(chunk, icyState, currentTitle);
+                for (const piece of pieces) {
+                  controller.enqueue(piece);
+                }
+              } else {
+                controller.enqueue(chunk);
+              }
+            } catch {}
+          }
         } else if (config.lowLatency && state.isBroadcasting) {
           httpLog.debug(`[HTTP] low-latency live: bypass preBuffer`);
         }
-        state.clients.set(clientId, { id: clientId, controller, connectedAt: new Date(), ip, userAgent, bytesSent: 0, slowStrikes: 0, icy: icyState, tier });
+        const clientObj = { id: clientId, controller, connectedAt: new Date(), ip, userAgent, bytesSent: 0, slowStrikes: 0, icy: icyState, tier };
+        state.clients.set(clientId, clientObj);
+        if (tier === "mp3") {
+          state.mp3Clients.set(clientId, clientObj);
+        } else {
+          state.opusClients.set(clientId, clientObj);
+        }
+        state.listenersMp3 = state.mp3Clients.size;
+        state.listenersOpus = state.opusClients.size;
         state.totalListenersServed++;
-        const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-        const mp3Count = state.clients.size - opusCount;
-        httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${mp3Count} opus:${opusCount})`);
+        httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${state.listenersMp3} opus:${state.listenersOpus})`);
       },
-      cancel() { state.clients.delete(clientId); httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`); },
-    }, { highWaterMark: config.lowLatency ? 16 * 1024 : config.preBufferBytes + 256 * 1024 });
-    req.signal.addEventListener("abort", () => { state.clients.delete(clientId); });
+      cancel() {
+        state.clients.delete(clientId);
+        state.mp3Clients.delete(clientId);
+        state.opusClients.delete(clientId);
+        state.listenersMp3 = state.mp3Clients.size;
+        state.listenersOpus = state.opusClients.size;
+        httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`);
+      },
+    }, {
+      highWaterMark: config.lowLatency ? 64 * 1024 : config.preBufferBytes + 256 * 1024,
+      size(chunk: Uint8Array) {
+        return chunk.byteLength;
+      },
+    });
+    req.signal.addEventListener("abort", () => {
+      state.clients.delete(clientId);
+      state.mp3Clients.delete(clientId);
+      state.opusClients.delete(clientId);
+      state.listenersMp3 = state.mp3Clients.size;
+      state.listenersOpus = state.opusClients.size;
+    });
     return new Response(stream, { headers: streamHeaders });
   }
 
@@ -2534,17 +3006,20 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   }
   if (path === "/app.js") {
     try {
-      // Bun natively compiles TSX — build on the fly (cached)
-      const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
-      if (!build.success || !build.outputs[0]) throw new Error("Build failed");
-      const js = await build.outputs[0].text();
+      const js = await getOrBuildAppJs();
       return new Response(js, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
     } catch (e: any) {
       return new Response(`console.error("Web build failed: ${String(e.message).replace(/"/g, "'")}");`, { headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
     }
   }
 
-  // ---- Web API — control from TSX (no auth for local, uses same as MCP later) ----
+  // ---- Web API & Admin Endpoints (protected with checkAdminAuth) ----
+  if (path.startsWith("/api/") || path.startsWith("/admin/api/")) {
+    if (!checkAdminAuth(req)) {
+      return unauthorized();
+    }
+  }
+
   if (path === "/api/fallback" && req.method === "POST") {
     try {
       const { folder } = await req.json() as any;
@@ -2571,19 +3046,14 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   }
   if (path === "/api/skip" && req.method === "POST") {
     try {
-      const { stopFallback, startFallback } = await import("./audio-router");
-      // @ts-ignore
-      const { state: st } = await import("./state");
-      // force skip: stop current and start next
-      try { stopFallback(); } catch {}
-      // reshuffle index
-      setTimeout(() => { try { startFallback(); } catch {} }, 100);
+      const { actionSkipFallback } = await import("./audio-router");
+      actionSkipFallback();
       return Response.json({ ok: true, message: "Skipped" }, { headers: corsHeaders() });
     } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
   }
   if (path === "/api/stop" && req.method === "POST") {
-    setTimeout(() => process.exit(0), 200);
-    return Response.json({ ok: true, message: "Stopping..." }, { headers: corsHeaders() });
+    setTimeout(() => gracefulShutdown(0), 50);
+    return Response.json({ ok: true, message: "Stopping gracefully..." }, { headers: corsHeaders() });
   }
 
   // ---- Health/Status/Metrics ----
@@ -2594,22 +3064,115 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
     const masterAlive = state.masterProcess !== null;
     const opusAlive = state.opusProcess !== null;
     const sourceAlive = state.sourceProcess !== null;
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    const mp3Count = state.clients.size - opusCount;
-    return Response.json({ status: "ok", uptime: uptimeSeconds, memory: { rss: Math.round(mem.rss/1024/1024), heapTotal: Math.round(mem.heapTotal/1024/1024), heapUsed: Math.round(mem.heapUsed/1024/1024), external: Math.round(mem.external/1024/1024) }, processes: { masterEncoder: masterAlive, opusTier: opusAlive, rtmpSource: sourceAlive }, broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, fallback: { active: fallbackActive, paused: state.fallbackPaused, currentTrack: state.currentTrack?.title || null }, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, tiers: { mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime }, opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null } }, { headers: corsHeaders() });
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
+    const audioStalled = state.audioClockSamples === 0 && uptimeSeconds > 5 && !state.fallbackPaused;
+    const overallStatus = audioStalled ? "degraded" : "ok";
+    return Response.json({
+      status: overallStatus,
+      uptime: uptimeSeconds,
+      memory: {
+        rss: Math.round(mem.rss/1024/1024),
+        heapTotal: Math.round(mem.heapTotal/1024/1024),
+        heapUsed: Math.round(mem.heapUsed/1024/1024),
+        external: Math.round(mem.external/1024/1024),
+      },
+      processes: {
+        masterEncoder: masterAlive,
+        opusTier: opusAlive,
+        rtmpSource: sourceAlive,
+      },
+      broadcasting: state.isBroadcasting,
+      sourceConnected: state.sourceConnected,
+      fallback: {
+        active: fallbackActive,
+        paused: state.fallbackPaused,
+        currentTrack: state.currentTrack?.title || null,
+      },
+      listeners: state.clients.size,
+      listenersMp3: mp3Count,
+      listenersOpus: opusCount,
+      maxListeners: config.maxListeners,
+      totalListenersServed: state.totalListenersServed,
+      totalBytesReceived: state.totalBytesReceived,
+      totalBytesSent: state.totalBytesSent,
+      totalBytesSentOpus: state.totalBytesSentOpus,
+      detectedBitrateKbps: state.detectedBitrateKbps,
+      detectedSampleRate: state.detectedSampleRate,
+      audio: {
+        clockSamples: state.audioClockSamples,
+        samplesProduced: state.audioSamplesProduced,
+        underruns: state.audioUnderruns,
+        lastSourceAudioTimeMs: state.lastSourceAudioTimeMs,
+        lastPcmSampleTimeMs: state.lastPcmSampleTimeMs,
+      },
+      evictions: state.evictionsTotal,
+      deckState: state.deckState,
+      tiers: {
+        mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime },
+        opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null,
+      },
+    }, { headers: corsHeaders() });
   }
   if (path === "/debug-state") {
     return Response.json({ activeDeck, transitionStarted, isStoppingFallback, deckA: { hasProcess: deckA.process !== null, currentTrackFile: deckA.currentTrackFile, bufferLength: deckA.buffer.length }, deckB: { hasProcess: deckB.process !== null, currentTrackFile: deckB.currentTrackFile, bufferLength: deckB.buffer.length } }, { headers: corsHeaders() });
   }
   if (path === "/status") {
     const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: state.clients.size - opusCount, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
+    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    const mp3Count = state.clients.size - opusCount;
-    const lines = ["# HELP radio_listeners Oyentes conectados actualmente","# TYPE radio_listeners gauge",`radio_listeners ${state.clients.size}`,"# HELP radio_listeners_mp3 Oyentes mp3","# TYPE radio_listeners_mp3 gauge",`radio_listeners_mp3 ${mp3Count}`,"# HELP radio_listeners_opus Oyentes opus tier","# TYPE radio_listeners_opus gauge",`radio_listeners_opus ${opusCount}`,"# HELP radio_broadcasting 1 si hay una fuente transmitiendo, 0 si no","# TYPE radio_broadcasting gauge",`radio_broadcasting ${state.isBroadcasting ? 1 : 0}`,"# HELP radio_bytes_received_total Bytes totales recibidos de la fuente","# TYPE radio_bytes_received_total counter",`radio_bytes_received_total ${state.totalBytesReceived}`,"# HELP radio_bytes_sent_total Bytes totales enviados a oyentes mp3","# TYPE radio_bytes_sent_total counter",`radio_bytes_sent_total ${state.totalBytesSent}`,"# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier","# TYPE radio_bytes_sent_opus_total counter",`radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,"# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise","# TYPE radio_fallback_active gauge",`radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,"# HELP radio_opus_tier_enabled 1 si opus tier habilitado","# TYPE radio_opus_tier_enabled gauge",`radio_opus_tier_enabled ${config.opusTierEnabled ? 1 : 0}`];
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
+    const lines = [
+      "# HELP radio_listeners Oyentes conectados actualmente",
+      "# TYPE radio_listeners gauge",
+      `radio_listeners ${state.clients.size}`,
+      "# HELP radio_listeners_mp3 Oyentes mp3",
+      "# TYPE radio_listeners_mp3 gauge",
+      `radio_listeners_mp3 ${mp3Count}`,
+      "# HELP radio_listeners_opus Oyentes opus tier",
+      "# TYPE radio_listeners_opus gauge",
+      `radio_listeners_opus ${opusCount}`,
+      "# HELP radio_broadcasting 1 si hay una fuente transmitiendo, 0 si no",
+      "# TYPE radio_broadcasting gauge",
+      `radio_broadcasting ${state.isBroadcasting ? 1 : 0}`,
+      "# HELP radio_bytes_received_total Bytes totales recibidos de la fuente",
+      "# TYPE radio_bytes_received_total counter",
+      `radio_bytes_received_total ${state.totalBytesReceived}`,
+      "# HELP radio_bytes_sent_total Bytes totales enviados a oyentes mp3",
+      "# TYPE radio_bytes_sent_total counter",
+      `radio_bytes_sent_total ${state.totalBytesSent}`,
+      "# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier",
+      "# TYPE radio_bytes_sent_opus_total counter",
+      `radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,
+      "# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise",
+      "# TYPE radio_fallback_active gauge",
+      `radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,
+      "# HELP radio_opus_tier_enabled 1 si opus tier habilitado",
+      "# TYPE radio_opus_tier_enabled gauge",
+      `radio_opus_tier_enabled ${config.opusTierEnabled ? 1 : 0}`,
+      "# HELP radio_audio_samples_produced_total Muestras de audio producidas",
+      "# TYPE radio_audio_samples_produced_total counter",
+      `radio_audio_samples_produced_total ${state.audioSamplesProduced}`,
+      "# HELP radio_audio_underruns_total Huecos o ausencias de audio",
+      "# TYPE radio_audio_underruns_total counter",
+      `radio_audio_underruns_total ${state.audioUnderruns}`,
+      "# HELP radio_evictions_slow_client Desconexiones por cliente lento",
+      "# TYPE radio_evictions_slow_client counter",
+      `radio_evictions_slow_client ${state.evictionsTotal.slowClient}`,
+      "# HELP radio_evictions_backpressure Desconexiones por saturacion de buffer",
+      "# TYPE radio_evictions_backpressure counter",
+      `radio_evictions_backpressure ${state.evictionsTotal.backpressure}`,
+      "# HELP radio_deck_state_a Estado de deck A",
+      "# TYPE radio_deck_state_a gauge",
+      `radio_deck_state_a{state="${state.deckState.A}"} 1`,
+      "# HELP radio_deck_state_b Estado de deck B",
+      "# TYPE radio_deck_state_b gauge",
+      `radio_deck_state_b{state="${state.deckState.B}"} 1`,
+    ];
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }
   return Response.json({ error: "Not Found" }, { status: 404, headers: corsHeaders() });
@@ -2618,23 +3181,76 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
 export const httpServer = tryServe(config.dashboardPort);
 export const outputServer = config.outputPort !== config.dashboardPort ? tryServe(config.outputPort) : httpServer;
 
+export async function gracefulShutdown(exitCode = 0): Promise<void> {
+  if (state.shuttingDown) return;
+  state.shuttingDown = true;
+  httpLog.info("Iniciando apagado ordenado (graceful shutdown)...");
+
+  for (const [id, client] of state.clients) {
+    try {
+      client.controller.close();
+    } catch {
+      /* noop */
+    }
+  }
+  state.clients.clear();
+  state.mp3Clients.clear();
+  state.opusClients.clear();
+  state.listenersMp3 = 0;
+  state.listenersOpus = 0;
+
+  stopPlaylistWatcher();
+  stopAudioWatchdog();
+  stopMasterEncoder();
+
+  if (state.sourceProcess) {
+    try { state.sourceProcess.kill(); } catch {}
+    state.sourceProcess = null;
+  }
+  if (deckA.process) {
+    try { deckA.process.kill(); } catch {}
+    deckA.process = null;
+  }
+  if (deckB.process) {
+    try { deckB.process.kill(); } catch {}
+    deckB.process = null;
+  }
+
+  flushLogsSync();
+
+  try { httpServer?.stop(true); } catch {}
+  try { if (outputServer !== httpServer) outputServer?.stop(true); } catch {}
+
+  setTimeout(() => process.exit(exitCode), 100);
+}
+
+process.on("SIGINT", () => gracefulShutdown(0));
+process.on("SIGTERM", () => gracefulShutdown(0));
+
 
 ```
-
----
 
 ## `src/icy-metadata.ts`
 
 ```ts
 const META_INTERVAL = 65536;
 
+const metaBlockCache = new Map<string, Uint8Array>();
+const EMPTY_META_BLOCK = new Uint8Array([0]);
+
 export function buildMetadataBlock(streamTitle: string): Uint8Array {
+  if (!streamTitle) return EMPTY_META_BLOCK;
+  const cached = metaBlockCache.get(streamTitle);
+  if (cached) return cached;
+
   const trimmed = streamTitle.slice(0, 400).replace(/'/g, "\\'");
   const encoded = new TextEncoder().encode(`StreamTitle='${trimmed}';StreamUrl='';`);
   const blockSize = Math.ceil((encoded.length + 1) / 16) * 16;
   const buf = new Uint8Array(blockSize + 1);
   buf[0] = blockSize / 16;
   buf.set(encoded, 1);
+
+  metaBlockCache.set(streamTitle, buf);
   return buf;
 }
 
@@ -2655,8 +3271,6 @@ export function chunkWithIcy(
   state: IcyClientState,
   title: string,
 ): Uint8Array[] {
-  if (!title) return [chunk];
-
   const result: Uint8Array[] = [];
   let offset = 0;
 
@@ -2664,16 +3278,18 @@ export function chunkWithIcy(
     const remaining = chunk.length - offset;
     const space = state.metaInterval - state.bytesSinceMeta;
 
-    if (remaining <= space) {
-      const piece = remaining === chunk.length ? chunk : chunk.slice(offset);
+    if (remaining < space) {
+      const piece = offset === 0 && remaining === chunk.length ? chunk : chunk.subarray(offset);
       result.push(piece);
       state.bytesSinceMeta += remaining;
       offset = chunk.length;
     } else {
-      result.push(chunk.slice(offset, offset + space));
+      // Chunk de audio hasta el intervalo de metadata
+      result.push(chunk.subarray(offset, offset + space));
       state.bytesSinceMeta += space;
       offset += space;
 
+      // Inyectar bloque de metadatos (0x00 si título vacío o bloque formateado)
       const metaBlock = buildMetadataBlock(title);
       result.push(metaBlock);
       state.bytesSinceMeta = 0;
@@ -2684,8 +3300,6 @@ export function chunkWithIcy(
 }
 
 ```
-
----
 
 ## `src/index-rtmp.ts`
 
@@ -2768,8 +3382,6 @@ process.on("unhandledRejection", (reason) => {
 });
 
 ```
-
----
 
 ## `src/lame-ffi.ts`
 
@@ -2857,16 +3469,11 @@ export function isNativeLameAvailable(): boolean {
   return false;
 }
 
-// Anillo de buffers MP3 pre-asignados (diseño "cero allocaciones"):
-// la steady-state de un stream 24/7 no debe alocar memoria por chunk.
-// encode() escribe en el siguiente slot del anillo y devuelve una vista
-// (sin copia). Con los decks emitiendo ~1 chunk/s (asetnsamples), el slot
-// se reutiliza tras MP3_SLOT_COUNT encodes (~128s), y la política de
-// expulsión de oyentes lentos (highWaterMark 256KB + 5 strikes ≈ ~7s de
-// lag máximo) garantiza que ningún oyente lea un slot ya sobrescrito.
-// preBuffer (64KB) solo retiene vistas recientes, siempre válidas.
+// Anillo de buffers MP3 scratch pre-asignados:
+// encode() escribe en el scratch y broadcaster copia de inmediato la salida publicada.
+// Con la copia defensiva en publicación, solo se requieren 4 slots transitorios (288 KB en vez de 9 MB).
 const MP3_SLOT_SIZE = 72 * 1024;
-const MP3_SLOT_COUNT = 128;
+const MP3_SLOT_COUNT = 4;
 const EMPTY_MP3 = new Uint8Array(0);
 
 export class LameEncoder {
@@ -2987,8 +3594,6 @@ export class LameEncoder {
 
 ```
 
----
-
 ## `src/logger.ts`
 
 ```ts
@@ -3001,13 +3606,54 @@ function ts(): string {
   return new Date().toISOString();
 }
 
-function appendFileLog(scope: string, level: string, args: unknown[]) {
+import fs from "fs";
+
+let logQueue: string[] = [];
+let isFlushing = false;
+const MAX_BATCH_SIZE = 50;
+const FLUSH_INTERVAL_MS = 100;
+
+function flushLogsAsync() {
+  if (isFlushing || logQueue.length === 0) return;
+  isFlushing = true;
+  const batch = logQueue.splice(0, logQueue.length);
+  const text = batch.join("");
+
+  // Escribir asíncronamente en ambos archivos
+  Promise.all([
+    fs.promises.appendFile("opus-debug.log", text).catch(() => {}),
+    fs.promises.appendFile("bunradio.log", text).catch(() => {}),
+  ]).finally(() => {
+    isFlushing = false;
+    if (logQueue.length >= MAX_BATCH_SIZE) {
+      flushLogsAsync();
+    }
+  });
+}
+
+// Timer en segundo plano para vaciar logs periódicamente sin bloquear event loop
+const flushTimer = setInterval(flushLogsAsync, FLUSH_INTERVAL_MS);
+if (typeof flushTimer.unref === "function") flushTimer.unref();
+
+export function flushLogsSync() {
+  if (logQueue.length === 0) return;
+  const batch = logQueue.splice(0, logQueue.length);
+  const text = batch.join("");
   try {
-    const line = `[${ts()}] ${level} [${scope}] ${args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
-    // No reinicia terminal -- escribe a archivo persistente
-    require("fs").appendFileSync("opus-debug.log", line);
-    require("fs").appendFileSync("bunradio.log", line);
+    fs.appendFileSync("opus-debug.log", text);
+    fs.appendFileSync("bunradio.log", text);
   } catch {}
+}
+
+process.on("beforeExit", flushLogsSync);
+process.on("exit", flushLogsSync);
+
+function appendFileLog(scope: string, level: string, args: unknown[]) {
+  const line = `[${ts()}] ${level} [${scope}] ${args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")}\n`;
+  logQueue.push(line);
+  if (logQueue.length >= MAX_BATCH_SIZE) {
+    flushLogsAsync();
+  }
 }
 
 function makeLogger(scope: string) {
@@ -3042,8 +3688,6 @@ export const httpLog = makeLogger("HTTP");
 export const sysLog = makeLogger("SYS");
 
 ```
-
----
 
 ## `src/mcp-server.ts`
 
@@ -3340,45 +3984,158 @@ if (import.meta.main) {
 
 ```
 
----
-
 ## `src/pre-buffer.ts`
 
 ```ts
 import { config } from "./config";
+import { AudioRingBuffer } from "./ring-buffer";
 
 export class PreBuffer {
-  private chunks: Uint8Array[] = [];
-  private totalBytes = 0;
+  public readonly ring: AudioRingBuffer;
 
-  constructor(private readonly maxBytes: number) { }
+  constructor(private readonly maxBytes: number) {
+    this.ring = new AudioRingBuffer(maxBytes);
+  }
 
-  push(chunk: Uint8Array): void {
-    if (this.maxBytes <= 0) return;
-    this.chunks.push(chunk);
-    this.totalBytes += chunk.byteLength;
-    while (this.totalBytes > this.maxBytes && this.chunks.length > 1) {
-      const removed = this.chunks.shift()!;
-      this.totalBytes -= removed.byteLength;
-    }
+  push(chunk: Uint8Array, generation = 0): import("./ring-buffer").AudioSlot | null {
+    if (this.maxBytes <= 0 || chunk.byteLength === 0) return null;
+    return this.ring.push(chunk, generation);
   }
 
   snapshot(): Uint8Array[] {
-    return [...this.chunks];
+    return this.ring.getSnapshot(this.maxBytes);
   }
 
   reset(): void {
-    this.chunks = [];
-    this.totalBytes = 0;
+    this.ring.reset();
+  }
+
+  get bytes(): number {
+    return this.ring.bytes;
   }
 }
 
 export const preBuffer = new PreBuffer(config.preBufferBytes);
 export const preBufferOpus = new PreBuffer(config.preBufferBytes);
 
+
 ```
 
----
+## `src/ring-buffer.ts`
+
+```ts
+export interface RingSlot {
+  seqId: number;
+  timestampMs: number;
+  generation: number;
+  data: Uint8Array;
+}
+
+export class AudioRingBuffer {
+  private slots: RingSlot[] = [];
+  private totalBytes = 0;
+  private seqCounter = 0;
+  private readonly maxBytes: number;
+
+  constructor(maxBytes = 256 * 1024) {
+    this.maxBytes = maxBytes;
+  }
+
+  /**
+   * Pushes a chunk into the ring buffer. Creates an immutable copy so
+   * underlying scratch buffers (e.g. LAME FFI) cannot overwrite active audio.
+   */
+  push(chunk: Uint8Array, generation = 0): RingSlot {
+    if (chunk.byteLength === 0) {
+      throw new Error("Cannot push empty chunk");
+    }
+
+    const immutableData = new Uint8Array(chunk);
+    this.seqCounter++;
+    const slot: RingSlot = {
+      seqId: this.seqCounter,
+      timestampMs: Date.now(),
+      generation,
+      data: immutableData,
+    };
+
+    this.slots.push(slot);
+    this.totalBytes += immutableData.byteLength;
+
+    // Evict older slots when exceeding maxBytes capacity
+    while (this.totalBytes > this.maxBytes && this.slots.length > 1) {
+      const evicted = this.slots.shift()!;
+      this.totalBytes -= evicted.data.byteLength;
+    }
+
+    return slot;
+  }
+
+  get length(): number {
+    return this.slots.length;
+  }
+
+  get bytes(): number {
+    return this.totalBytes;
+  }
+
+  get latestSeq(): number {
+    return this.seqCounter;
+  }
+
+  get oldestSeq(): number {
+    return this.slots.length > 0 ? this.slots[0]!.seqId : 0;
+  }
+
+  /**
+   * Returns a snapshot of recent chunks up to requested bytes for instant prebuffering.
+   */
+  getSnapshot(requestedBytes: number): Uint8Array[] {
+    if (this.slots.length === 0 || requestedBytes <= 0) return [];
+
+    const result: Uint8Array[] = [];
+    let accumulated = 0;
+
+    for (let i = this.slots.length - 1; i >= 0; i--) {
+      const data = this.slots[i]!.data;
+      result.unshift(data);
+      accumulated += data.byteLength;
+      if (accumulated >= requestedBytes) break;
+    }
+
+    return result;
+  }
+
+  /**
+   * Reads all slots starting after fromSeqId.
+   * Returns null if client cursor has fallen off the ring buffer (lag exceeded).
+   */
+  readSince(fromSeqId: number): { slots: RingSlot[]; latestSeq: number } | null {
+    if (this.slots.length === 0) {
+      return { slots: [], latestSeq: this.seqCounter };
+    }
+
+    const oldest = this.slots[0]!.seqId;
+    if (fromSeqId < oldest - 1) {
+      return null;
+    }
+
+    const startIndex = Math.max(0, fromSeqId + 1 - oldest);
+    const unread = this.slots.slice(startIndex);
+    return { slots: unread, latestSeq: this.seqCounter };
+  }
+
+  clear() {
+    this.reset();
+  }
+
+  reset() {
+    this.slots = [];
+    this.totalBytes = 0;
+  }
+}
+
+```
 
 ## `src/state.ts`
 
@@ -3405,8 +4162,14 @@ export interface ActiveTrackInfo {
   startedAt: number; // timestamp ms
 }
 
+export type DeckState = "IDLE" | "PRELOADING" | "READY" | "PLAYING" | "CROSSFADING" | "DRAINING" | "STOPPED";
+
 export const state = {
   clients: new Map<string, RadioClient>(),
+  mp3Clients: new Map<string, RadioClient>(),
+  opusClients: new Map<string, RadioClient>(),
+  listenersMp3: 0,
+  listenersOpus: 0,
   isBroadcasting: false,
   sourceConnected: false,
   sourceProcess: null as any | null,
@@ -3421,10 +4184,234 @@ export const state = {
   detectedBitrateKbps: null as number | null,
   detectedSampleRate: null as number | null,
 
+  // Deck Lifecycle & State Machine
+  deckState: { A: "IDLE" as DeckState, B: "IDLE" as DeckState },
+  deckSessions: { A: "", B: "" },
+  deckGenerations: { A: 0, B: 0 },
+
+  // Audio Clock & Precision Metrics
+  audioClockSamples: 0,
+  audioSamplesProduced: 0,
+  audioUnderruns: 0,
+  lastSourceAudioTimeMs: 0,
+  lastPcmSampleTimeMs: 0,
+  evictionsTotal: { slowClient: 0, backpressure: 0, timeout: 0 },
+
   fallbackQueue: [] as string[],
   currentTrack: null as ActiveTrackInfo | null,
   fallbackPaused: false,
 };
+
+
+
+```
+
+## `src/web/App.tsx`
+
+```tsx
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+
+type Status = {
+  broadcasting: boolean;
+  sourceConnected: boolean;
+  listeners: number;
+  listenersMp3: number;
+  listenersOpus: number;
+  fallbackActive: boolean;
+  stationName: string;
+  detectedBitrateKbps: number | null;
+  fallback: { active: boolean; currentTrack: string | null };
+  uptimeSeconds: number;
+};
+
+const NEON = {
+  bg: "#0a0e14",
+  panel: "#11151c",
+  cyan: "#00f5ff",
+  magenta: "#ff00ff",
+  yellow: "#ffd60a",
+  green: "#00ff88",
+  red: "#ff3b30",
+  grey: "#8a8f98",
+};
+
+function App() {
+  const [status, setStatus] = useState<Status | null>(null);
+  const [health, setHealth] = useState<any>(null);
+  const [queue, setQueue] = useState<string[]>([]);
+  const [fallback, setFallback] = useState("");
+  const [newSong, setNewSong] = useState("");
+  const [newFolder, setNewFolder] = useState("");
+
+  const refresh = async () => {
+    try {
+      const [s, h] = await Promise.all([
+        fetch("/status").then(r => r.json()) as Promise<Status>,
+        fetch("/health").then(r => r.json()) as Promise<any>,
+      ]);
+      setStatus(s as any);
+      setHealth(h as any);
+      if ((h as any)?.fallback) setFallback((h as any).fallback?.currentTrack || "");
+    } catch {}
+  };
+
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 1000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const setMusicFolder = async (folder: string) => {
+    const res = await fetch("/api/fallback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder }),
+    });
+    const j: any = await res.json();
+    alert(j.message || (folder === "" ? "Live-only" : `Folder set to ${folder}`));
+    refresh();
+  };
+
+  const addSong = async () => {
+    if (!newSong.trim()) return alert("Enter file path");
+    const res = await fetch("/api/queue/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: newSong.trim() }),
+    });
+    const j: any = await res.json();
+    alert(j.message || "Added");
+    setNewSong("");
+    refresh();
+  };
+
+  const addFolder = async () => {
+    if (!newFolder.trim()) return alert("Enter folder");
+    await setMusicFolder(newFolder.trim());
+    setNewFolder("");
+  };
+
+  const skip = async () => {
+    await fetch("/api/skip", { method: "POST" });
+    refresh();
+  };
+
+  const isLive = status?.broadcasting;
+  const dotColor = isLive ? NEON.red : NEON.yellow;
+  const dot = isLive ? "● LIVE" : "○ SILENCE";
+
+  return (
+    <div style={{ minHeight: "100vh", background: NEON.bg, color: "#e6e8eb", padding: "0" }}>
+      {/* Header */}
+      <header style={{ background: NEON.panel, borderBottom: `1px solid ${NEON.cyan}`, padding: "16px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 24, fontWeight: 800, color: NEON.cyan, letterSpacing: 1 }}>◉ BUNRADIO</span>
+          <span style={{ color: NEON.grey, fontSize: 13 }}>Ultra-Low-Latency • v1.0.0</span>
+          <span style={{ background: isLive ? NEON.red : NEON.yellow, color: isLive ? "white" : "#1a1200", padding: "2px 8px", borderRadius: 12, fontSize: 12, fontWeight: 700 }}>{dot}</span>
+        </div>
+        <div style={{ display: "flex", gap: 16, fontSize: 13, color: NEON.grey }}>
+          <span><b style={{ color: "#fff" }}>{status?.listeners ?? 0}</b> listeners <span style={{ opacity: 0.6 }}>({status?.listenersMp3 ?? 0} mp3 · {status?.listenersOpus ?? 0} opus)</span></span>
+          <span>up {status ? Math.floor(status.uptimeSeconds / 60) + ":" + String(status.uptimeSeconds % 60).padStart(2, "0") : "--:--"}</span>
+        </div>
+      </header>
+
+      {/* Hero Now Playing */}
+      <section style={{ margin: 24, background: NEON.panel, border: `1px solid ${NEON.cyan}`, borderRadius: 12, padding: 24, display: "grid", gridTemplateColumns: "1fr 320px", gap: 24 }}>
+        <div>
+          <div style={{ fontSize: 12, letterSpacing: 1, color: NEON.cyan, fontWeight: 700, marginBottom: 8 }}>♫ NOW PLAYING</div>
+          <div style={{ fontSize: 28, fontWeight: 800, color: "white", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {status?.fallbackActive ? (health?.fallback?.currentTrack || "—") : isLive ? "🔴 LIVE" : "🔇 Silence"}
+          </div>
+          <div style={{ color: NEON.grey, fontSize: 13, marginTop: 4 }}>
+            {isLive ? "Live from OBS • SRT" : health?.fallback?.currentTrack ? `File • ${health.fallback.currentTrack}` : "Live-only • silence until OBS"}
+          </div>
+          <div style={{ marginTop: 16, height: 6, background: "#0f1419", borderRadius: 6, overflow: "hidden", border: `1px solid ${NEON.bg}` }}>
+            <div style={{ height: "100%", width: `${status?.fallbackActive && health?.fallback?.currentTrack ? 42 : isLive ? 100 : 6}%`, background: isLive ? NEON.red : NEON.cyan, transition: "width 0.5s ease" }} />
+          </div>
+          <div style={{ display: "flex", gap: 12, marginTop: 12, fontSize: 12, color: NEON.grey }}>
+            <span>MP3 320k</span><span>•</span><span>OPUS 96k eco</span><span>•</span><span style={{ color: dotColor }}>{dot}</span>
+          </div>
+        </div>
+        <div style={{ background: "#0a0e14", borderRadius: 8, padding: 16, border: `1px solid #1a1f2a` }}>
+          <div style={{ fontSize: 11, letterSpacing: 1, color: NEON.magenta, fontWeight: 700, marginBottom: 12 }}>◉ STREAMS — click to play</div>
+          <a href="/mp3" target="_blank" style={{ display: "block", background: NEON.green, color: "#001210", textAlign: "center", padding: "12px 0", borderRadius: 8, fontWeight: 800, textDecoration: "none", marginBottom: 10 }}>▶  MP3  ·  320k</a>
+          <a href="/opus" target="_blank" style={{ display: "block", background: NEON.magenta, color: "white", textAlign: "center", padding: "12px 0", borderRadius: 8, fontWeight: 800, textDecoration: "none" }}>♫  OPUS  ·  96k</a>
+          <div style={{ fontSize: 11, color: NEON.grey, marginTop: 12, lineHeight: 1.5 }}>
+            SRT ingest<br />
+            <code style={{ background: "#0f1419", padding: "2px 6px", borderRadius: 4, color: NEON.cyan, fontSize: 11 }}>srt://localhost:1936?streamid=live/...</code><br />
+            OBS → Service: Custom → Server: above
+          </div>
+        </div>
+      </section>
+
+      {/* Controls */}
+      <section style={{ margin: "0 24px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <div style={{ background: NEON.panel, border: `1px solid ${NEON.yellow}`, borderRadius: 12, padding: 16 }}>
+          <div style={{ fontSize: 11, letterSpacing: 1, color: NEON.yellow, fontWeight: 700, marginBottom: 12 }}>≡  QUEUE  — {queue.length || health?.fallback ? "•" : "empty"}</div>
+          <div style={{ maxHeight: 160, overflowY: "auto", fontSize: 13, lineHeight: 1.8, color: NEON.grey }}>
+            {queue.length === 0 ? (
+              <div style={{ color: NEON.grey, fontStyle: "italic" }}>Empty — live-only<br /><span style={{ fontSize: 11 }}>Add music below</span></div>
+            ) : (
+              queue.map((f, i) => <div key={i} style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: i === 0 ? NEON.yellow : NEON.grey }}>{i === 0 ? "▶ " : "  "}{f.split("/").pop()}</div>)
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button onClick={() => { const v = prompt("File path (mp3/flac/wav)", newSong); if (v) { setNewSong(v); setTimeout(addSong, 0); } }} style={{ flex: 1, background: "#1e2a1e", color: NEON.green, border: `1px solid ${NEON.green}`, borderRadius: 8, padding: "8px 0", cursor: "pointer", fontWeight: 700 }}>+ Song</button>
+            <button onClick={() => { const v = prompt("Folder (empty = live-only)", newFolder || "musica"); if (v !== null) { setNewFolder(v); setTimeout(addFolder, 0); } }} style={{ flex: 1, background: "#1e1e2a", color: NEON.cyan, border: `1px solid ${NEON.cyan}`, borderRadius: 8, padding: "8px 0", cursor: "pointer", fontWeight: 700 }}>+ Folder</button>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <input value={newSong} onChange={e => setNewSong((e.target as HTMLInputElement).value)} placeholder="File path" style={{ flex: 1, background: "#0a0e14", border: "1px solid #2a2f3a", color: "white", padding: "6px 8px", borderRadius: 6, fontSize: 12 }} />
+            <button onClick={addSong} style={{ background: NEON.green, color: "#001210", border: "none", borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontWeight: 700 }}>Add</button>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <input value={newFolder} onChange={e => setNewFolder((e.target as HTMLInputElement).value)} placeholder="Folder (e.g. musica)" style={{ flex: 1, background: "#0a0e14", border: "1px solid #2a2f3a", color: "white", padding: "6px 8px", borderRadius: 6, fontSize: 12 }} />
+            <button onClick={addFolder} style={{ background: NEON.cyan, color: "#001210", border: "none", borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontWeight: 700 }}>Set</button>
+          </div>
+          <button onClick={skip} style={{ width: "100%", marginTop: 12, background: "transparent", color: NEON.grey, border: `1px solid #2a2f3a`, borderRadius: 8, padding: "8px 0", cursor: "pointer" }}>Skip track →</button>
+        </div>
+
+        <div style={{ background: NEON.panel, border: `1px solid #2a2f3a`, borderRadius: 12, padding: 16 }}>
+          <div style={{ fontSize: 11, letterSpacing: 1, color: NEON.grey, fontWeight: 700, marginBottom: 12 }}>●  HEALTH & CONTROL</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13 }}>
+            <div style={{ background: "#0a0e14", borderRadius: 8, padding: 12, border: `1px solid ${isLive ? NEON.red : "#1a1f2a"}` }}>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>STATUS</div>
+              <div style={{ fontWeight: 800, color: isLive ? NEON.red : NEON.yellow, marginTop: 4 }}>{isLive ? "● LIVE" : "○ SILENCE"}</div>
+              <div style={{ color: NEON.grey, fontSize: 11, marginTop: 4 }}>{status?.sourceConnected ? "SRT connected" : "SRT waiting"}</div>
+            </div>
+            <div style={{ background: "#0a0e14", borderRadius: 8, padding: 12 }}>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>LISTENERS</div>
+              <div style={{ fontWeight: 800, fontSize: 20, color: "white" }}>{status?.listeners ?? 0}</div>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>{status?.listenersMp3 ?? 0} mp3 · {status?.listenersOpus ?? 0} opus</div>
+            </div>
+            <div style={{ background: "#0a0e14", borderRadius: 8, padding: 12 }}>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>MUSIC</div>
+              <div style={{ fontWeight: 700, color: "white", fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fallback || "live-only"}</div>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>{health?.fallback?.active ? "fallback active" : "silence"}</div>
+            </div>
+            <div style={{ background: "#0a0e14", borderRadius: 8, padding: 12 }}>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>UPTIME</div>
+              <div style={{ fontWeight: 800, color: "white" }}>{status ? `${Math.floor(status.uptimeSeconds / 60)}:${String(status.uptimeSeconds % 60).padStart(2, "0")}` : "--:--"}</div>
+              <div style={{ color: NEON.grey, fontSize: 11 }}>{health?.memory ? `${health.memory.rss}MB rss` : ""}</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <a href="/health" target="_blank" style={{ flex: 1, background: "#1a1a2e", color: "white", textAlign: "center", padding: "8px 0", borderRadius: 8, textDecoration: "none", fontSize: 12, border: `1px solid ${NEON.cyan}` }}>Health JSON</a>
+            <a href="/metrics" target="_blank" style={{ flex: 1, background: "#0f1419", color: NEON.grey, textAlign: "center", padding: "8px 0", borderRadius: 8, textDecoration: "none", fontSize: 12, border: "1px solid #2a2f3a" }}>Metrics</a>
+          </div>
+          <button onClick={async () => { if (confirm("Stop radio?")) { await fetch("/api/stop", { method: "POST" }); alert("Stopping…"); } }} style={{ width: "100%", marginTop: 12, background: NEON.red, color: "white", border: "none", borderRadius: 8, padding: "10px 0", cursor: "pointer", fontWeight: 800 }}>■ STOP RADIO</button>
+        </div>
+      </section>
+
+      <footer style={{ margin: 24, textAlign: "center", color: NEON.grey, fontSize: 11 }}>
+        BUNRADIO • Ultra-Low-Latency • Bun + TSX • <a href="/health" style={{ color: NEON.cyan, textDecoration: "none" }}>/health</a> • <a href="/mp3" style={{ color: NEON.green, textDecoration: "none" }}>/mp3</a> • <a href="/opus" style={{ color: NEON.magenta, textDecoration: "none" }}>/opus</a>
+      </footer>
+    </div>
+  );
+}
+
+const root = createRoot(document.getElementById("root")!);
+root.render(<App />);
 
 ```
 

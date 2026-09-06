@@ -94,8 +94,13 @@ export class AudioRingBuffer {
       return null;
     }
 
-    const unread = this.slots.filter(s => s.seqId > fromSeqId);
+    const startIndex = Math.max(0, fromSeqId + 1 - oldest);
+    const unread = this.slots.slice(startIndex);
     return { slots: unread, latestSeq: this.seqCounter };
+  }
+
+  clear() {
+    this.reset();
   }
 
   reset() {

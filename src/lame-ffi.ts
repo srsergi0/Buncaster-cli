@@ -81,16 +81,11 @@ export function isNativeLameAvailable(): boolean {
   return false;
 }
 
-// Anillo de buffers MP3 pre-asignados (diseño "cero allocaciones"):
-// la steady-state de un stream 24/7 no debe alocar memoria por chunk.
-// encode() escribe en el siguiente slot del anillo y devuelve una vista
-// (sin copia). Con los decks emitiendo ~1 chunk/s (asetnsamples), el slot
-// se reutiliza tras MP3_SLOT_COUNT encodes (~128s), y la política de
-// expulsión de oyentes lentos (highWaterMark 256KB + 5 strikes ≈ ~7s de
-// lag máximo) garantiza que ningún oyente lea un slot ya sobrescrito.
-// preBuffer (64KB) solo retiene vistas recientes, siempre válidas.
+// Anillo de buffers MP3 scratch pre-asignados:
+// encode() escribe en el scratch y broadcaster copia de inmediato la salida publicada.
+// Con la copia defensiva en publicación, solo se requieren 4 slots transitorios (288 KB en vez de 9 MB).
 const MP3_SLOT_SIZE = 72 * 1024;
-const MP3_SLOT_COUNT = 128;
+const MP3_SLOT_COUNT = 4;
 const EMPTY_MP3 = new Uint8Array(0);
 
 export class LameEncoder {

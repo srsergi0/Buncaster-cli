@@ -8,9 +8,9 @@ export class PreBuffer {
     this.ring = new AudioRingBuffer(maxBytes);
   }
 
-  push(chunk: Uint8Array, generation = 0): void {
-    if (this.maxBytes <= 0 || chunk.byteLength === 0) return;
-    this.ring.push(chunk, generation);
+  push(chunk: Uint8Array, generation = 0): import("./ring-buffer").AudioSlot | null {
+    if (this.maxBytes <= 0 || chunk.byteLength === 0) return null;
+    return this.ring.push(chunk, generation);
   }
 
   snapshot(): Uint8Array[] {

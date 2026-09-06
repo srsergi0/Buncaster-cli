@@ -19,12 +19,16 @@ import {
   transitionStarted,
   isStoppingFallback,
   opusHeaders,
+  stopMasterEncoder,
+  stopPlaylistWatcher,
+  stopAudioWatchdog,
 } from "./audio-router";
+import { flushLogsSync } from "./logger";
 
 import { StreamableHttpTransport, InMemorySessionAdapter } from "mcp-lite";
 import { mcpServer } from "./mcp-server";
 import { FORMAT_CONFIG } from "./format-config";
-import { type IcyClientState, createIcyState } from "./icy-metadata";
+import { type IcyClientState, createIcyState, chunkWithIcy } from "./icy-metadata";
 
 const mcpSessionAdapter = new InMemorySessionAdapter({ maxEventBufferSize: 100 });
 const mcpTransport = new StreamableHttpTransport({
@@ -62,10 +66,40 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
   throw new Error(`Failed to bind HTTP port ${port} after ${retries} tries`);
 }
 
+let appJsCache: string | null = null;
+let appJsBuilding: Promise<string> | null = null;
+
+async function getOrBuildAppJs(): Promise<string> {
+  if (appJsCache) return appJsCache;
+  if (appJsBuilding) return appJsBuilding;
+
+  appJsBuilding = (async () => {
+    try {
+      const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
+      if (!build.success || !build.outputs[0]) throw new Error("Build failed");
+      const js = await build.outputs[0].text();
+      appJsCache = js;
+      return js;
+    } finally {
+      appJsBuilding = null;
+    }
+  })();
+
+  return appJsBuilding;
+}
+
 // Store fetch handler for tryServe wrapper
 (globalThis as any).__bunServeFetch = async (req: Request, server: any) => {
   const url = new URL(req.url);
   const path = url.pathname;
+
+  // Aislamiento del puerto de salida: si config.outputPort !== config.dashboardPort y la petición viene por outputServer,
+  // restringir estrictamente a streams de audio y endpoints de lectura de estado.
+  if (server?.port === config.outputPort && config.outputPort !== config.dashboardPort) {
+    if (!STREAM_PATHS.has(path) && path !== "/health" && path !== "/status" && path !== "/metrics") {
+      return Response.json({ error: "Not Found on Stream Port" }, { status: 404, headers: corsHeaders() });
+    }
+  }
 
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders() });
@@ -136,7 +170,21 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
         if (isOpus && opusHeaders) { try { controller.enqueue(opusHeaders); } catch {} }
         const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
         if (shouldSendPreBuffer) {
-          for (const chunk of chosenPreBuffer.snapshot()) { try { controller.enqueue(chunk); } catch {} }
+          const currentTitle = state.currentTrack
+            ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
+            : "";
+          for (const chunk of chosenPreBuffer.snapshot()) {
+            try {
+              if (icyState) {
+                const pieces = chunkWithIcy(chunk, icyState, currentTitle);
+                for (const piece of pieces) {
+                  controller.enqueue(piece);
+                }
+              } else {
+                controller.enqueue(chunk);
+              }
+            } catch {}
+          }
         } else if (config.lowLatency && state.isBroadcasting) {
           httpLog.debug(`[HTTP] low-latency live: bypass preBuffer`);
         }
@@ -185,28 +233,6 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
       return new Response("<h1>BUNRADIO</h1><p>Web UI not built — run <code>bun run build</code></p><p><a href='/mp3'>/mp3</a> <a href='/opus'>/opus</a></p>", { headers: { "Content-Type": "text/html", ...corsHeaders() } });
     }
   }
-let appJsCache: string | null = null;
-let appJsBuilding: Promise<string> | null = null;
-
-async function getOrBuildAppJs(): Promise<string> {
-  if (appJsCache) return appJsCache;
-  if (appJsBuilding) return appJsBuilding;
-
-  appJsBuilding = (async () => {
-    try {
-      const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
-      if (!build.success || !build.outputs[0]) throw new Error("Build failed");
-      const js = await build.outputs[0].text();
-      appJsCache = js;
-      return js;
-    } finally {
-      appJsBuilding = null;
-    }
-  })();
-
-  return appJsBuilding;
-}
-
   if (path === "/app.js") {
     try {
       const js = await getOrBuildAppJs();
@@ -255,8 +281,8 @@ async function getOrBuildAppJs(): Promise<string> {
     } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
   }
   if (path === "/api/stop" && req.method === "POST") {
-    setTimeout(() => process.exit(0), 200);
-    return Response.json({ ok: true, message: "Stopping..." }, { headers: corsHeaders() });
+    setTimeout(() => gracefulShutdown(0), 50);
+    return Response.json({ ok: true, message: "Stopping gracefully..." }, { headers: corsHeaders() });
   }
 
   // ---- Health/Status/Metrics ----
@@ -269,8 +295,10 @@ async function getOrBuildAppJs(): Promise<string> {
     const sourceAlive = state.sourceProcess !== null;
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
+    const audioStalled = state.audioClockSamples === 0 && uptimeSeconds > 5 && !state.fallbackPaused;
+    const overallStatus = audioStalled ? "degraded" : "ok";
     return Response.json({
-      status: "ok",
+      status: overallStatus,
       uptime: uptimeSeconds,
       memory: {
         rss: Math.round(mem.rss/1024/1024),
@@ -381,4 +409,50 @@ async function getOrBuildAppJs(): Promise<string> {
 
 export const httpServer = tryServe(config.dashboardPort);
 export const outputServer = config.outputPort !== config.dashboardPort ? tryServe(config.outputPort) : httpServer;
+
+export async function gracefulShutdown(exitCode = 0): Promise<void> {
+  if (state.shuttingDown) return;
+  state.shuttingDown = true;
+  httpLog.info("Iniciando apagado ordenado (graceful shutdown)...");
+
+  for (const [id, client] of state.clients) {
+    try {
+      client.controller.close();
+    } catch {
+      /* noop */
+    }
+  }
+  state.clients.clear();
+  state.mp3Clients.clear();
+  state.opusClients.clear();
+  state.listenersMp3 = 0;
+  state.listenersOpus = 0;
+
+  stopPlaylistWatcher();
+  stopAudioWatchdog();
+  stopMasterEncoder();
+
+  if (state.sourceProcess) {
+    try { state.sourceProcess.kill(); } catch {}
+    state.sourceProcess = null;
+  }
+  if (deckA.process) {
+    try { deckA.process.kill(); } catch {}
+    deckA.process = null;
+  }
+  if (deckB.process) {
+    try { deckB.process.kill(); } catch {}
+    deckB.process = null;
+  }
+
+  flushLogsSync();
+
+  try { httpServer?.stop(true); } catch {}
+  try { if (outputServer !== httpServer) outputServer?.stop(true); } catch {}
+
+  setTimeout(() => process.exit(exitCode), 100);
+}
+
+process.on("SIGINT", () => gracefulShutdown(0));
+process.on("SIGTERM", () => gracefulShutdown(0));
 

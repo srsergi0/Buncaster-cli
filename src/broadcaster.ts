@@ -41,10 +41,9 @@ function getCurrentTitle(): string {
 export function broadcast(chunk: Uint8Array): void {
   if (chunk.byteLength === 0) return;
 
-  // Copia inmutable única al publicar (copy-on-publish)
-  // Aísla la memoria de trabajo de LAME FFI y el ring buffer
-  const data = new Uint8Array(chunk);
-  preBuffer.push(data);
+  // Una sola copia inmutable administrada por el RingBuffer al publicar
+  const slot = preBuffer.push(chunk);
+  const data = slot ? slot.data : new Uint8Array(chunk);
 
   if (state.mp3Clients.size === 0) return;
 
@@ -85,9 +84,9 @@ export function broadcast(chunk: Uint8Array): void {
 export function broadcastOpus(chunk: Uint8Array): void {
   if (chunk.byteLength === 0) return;
 
-  // Copia inmutable única al publicar para la rendition Opus
-  const data = new Uint8Array(chunk);
-  preBufferOpus.push(data);
+  // Una sola copia inmutable administrada por el RingBuffer al publicar
+  const slot = preBufferOpus.push(chunk);
+  const data = slot ? slot.data : new Uint8Array(chunk);
 
   if (state.opusClients.size === 0) return;
 

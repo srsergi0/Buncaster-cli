@@ -1,4 +1,5 @@
 import { config } from "./config";
+import { state } from "./state";
 import { rtmpLog } from "./logger";
 
 export interface Mp3FrameInfo {
@@ -94,5 +95,7 @@ export class BitrateDetector {
   }
 }
 export const bitrateDetector = new BitrateDetector((info) => {
+  state.detectedBitrateKbps = info.bitrateKbps;
+  state.detectedSampleRate = info.sampleRate;
   rtmpLog.debug(`Detected real bitrate: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`);
 });
