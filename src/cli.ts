@@ -64,10 +64,60 @@ function getPipedLines(): string[] {
   return pipedLines;
 }
 
+// Parse CLI arguments
+const args = process.argv.slice(2);
+let flagDashboard: string | null = null;
+let flagOutput: string | null = null;
+let flagSrt: string | null = null;
+let noPrompt = process.env.NO_PROMPT === "1" || process.env.NO_PROMPT === "true" ||
+               process.env.AUTO_START === "1" || process.env.AUTO_START === "true" ||
+               process.env.CI === "1" || process.env.CI === "true";
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === "-y" || arg === "--yes" || arg === "--no-prompt" || arg === "-q" || arg === "--quiet") {
+    noPrompt = true;
+  } else if (arg === "-p" || arg === "--port") {
+    const val = args[++i];
+    if (val && isValidPort(val)) {
+      flagDashboard = val;
+      flagOutput = val;
+    }
+  } else if (arg === "--dashboard-port" || arg === "-d") {
+    const val = args[++i];
+    if (val && isValidPort(val)) flagDashboard = val;
+  } else if (arg === "--output-port" || arg === "-o") {
+    const val = args[++i];
+    if (val && isValidPort(val)) flagOutput = val;
+  } else if (arg === "--srt-port" || arg === "-s") {
+    const val = args[++i];
+    if (val && isValidPort(val)) flagSrt = val;
+  } else if (arg === "-h" || arg === "--help") {
+    console.log(`
+Uso: bun run dev [opciones] o bun src/cli.ts [opciones]
+
+Opciones:
+  -y, --yes, --no-prompt       Inicia sin preguntas interactivas (usa env o defaults)
+  -p, --port <puerto>          Configura el puerto web y de streams
+  -d, --dashboard-port <p>     Configura el puerto del Dashboard web (default: 8080)
+  -o, --output-port <p>        Configura el puerto de streams /mp3 y /opus (default: 8080)
+  -s, --srt-port <p>           Configura el puerto de ingesta SRT para OBS (default: 1936)
+  -h, --help                   Muestra esta ayuda
+
+Variables de entorno:
+  NO_PROMPT=true               Omite preguntas interactivas
+  PORT / DASHBOARD_PORT        Puerto web
+  OUTPUT_PORT / STREAM_PORT    Puerto de streams
+  SRT_PORT                     Puerto de ingesta SRT
+`);
+    process.exit(0);
+  }
+}
+
 // Defaults
-const defDashboard = String(envInt("DASHBOARD_PORT", envInt("PORT", 8080)));
-const defOutput = String(envInt("OUTPUT_PORT", envInt("STREAM_PORT", Number(defDashboard))));
-const defSrt = String(envInt("SRT_PORT", 1936));
+const defDashboard = flagDashboard || String(envInt("DASHBOARD_PORT", envInt("PORT", 8080)));
+const defOutput = flagOutput || String(envInt("OUTPUT_PORT", envInt("STREAM_PORT", Number(defDashboard))));
+const defSrt = flagSrt || String(envInt("SRT_PORT", 1936));
 
 console.log("");
 console.log("  ╔══════════════════════════════════════════════════╗");
@@ -80,22 +130,25 @@ let dashboardPort = defDashboard;
 let outputPort = defOutput;
 let srtPort = defSrt;
 
-{
-  let v = await ask("Dashboard port (web UI)", defDashboard);
-  while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("Dashboard port (web UI)", defDashboard); }
-  dashboardPort = v;
-}
-{
-  // Default for outputs to the just-entered dashboard port (so they match unless user changes)
-  const defOut2 = outputPort === defOutput ? dashboardPort : outputPort;
-  let v = await ask("Outputs port (streams /mp3 and /opus)", defOut2);
-  while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("Outputs port (streams /mp3 and /opus)", defOut2); }
-  outputPort = v;
-}
-{
-  let v = await ask("OBS input port (SRT ingest)", defSrt);
-  while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("OBS input port (SRT ingest)", defSrt); }
-  srtPort = v;
+if (!noPrompt) {
+  if (!flagDashboard) {
+    let v = await ask("Dashboard port (web UI)", defDashboard);
+    while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("Dashboard port (web UI)", defDashboard); }
+    dashboardPort = v;
+  }
+  if (!flagOutput) {
+    const defOut2 = outputPort === defOutput ? dashboardPort : outputPort;
+    let v = await ask("Outputs port (streams /mp3 and /opus)", defOut2);
+    while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("Outputs port (streams /mp3 and /opus)", defOut2); }
+    outputPort = v;
+  }
+  if (!flagSrt) {
+    let v = await ask("OBS input port (SRT ingest)", defSrt);
+    while (!isValidPort(v)) { console.log("  ✖ Port must be 1-65535"); v = await ask("OBS input port (SRT ingest)", defSrt); }
+    srtPort = v;
+  }
+} else {
+  console.log("  ⚡ Modo no-interactivo activo (usando configuración de flags/env)");
 }
 console.log("");
 
