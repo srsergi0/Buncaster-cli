@@ -2028,7 +2028,7 @@ await import("./index-rtmp.ts");
 const dashUrl = `http://localhost:${config.dashboardPort}/`;
 const mp3Url = `http://localhost:${config.outputPort}/mp3`;
 const opusUrl = `http://localhost:${config.outputPort}/opus`;
-const srtUrl = `srt://localhost:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`;
+const srtUrl = `srt://127.0.0.1:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`;
 
 console.log("");
 console.log(`  ✓ Dashboard: ${dashUrl}`);
