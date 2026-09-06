@@ -133,15 +133,39 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
         } else if (config.lowLatency && state.isBroadcasting) {
           httpLog.debug(`[HTTP] low-latency live: bypass preBuffer`);
         }
-        state.clients.set(clientId, { id: clientId, controller, connectedAt: new Date(), ip, userAgent, bytesSent: 0, slowStrikes: 0, icy: icyState, tier });
+        const clientObj = { id: clientId, controller, connectedAt: new Date(), ip, userAgent, bytesSent: 0, slowStrikes: 0, icy: icyState, tier };
+        state.clients.set(clientId, clientObj);
+        if (tier === "mp3") {
+          state.mp3Clients.set(clientId, clientObj);
+        } else {
+          state.opusClients.set(clientId, clientObj);
+        }
+        state.listenersMp3 = state.mp3Clients.size;
+        state.listenersOpus = state.opusClients.size;
         state.totalListenersServed++;
-        const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-        const mp3Count = state.clients.size - opusCount;
-        httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${mp3Count} opus:${opusCount})`);
+        httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${state.listenersMp3} opus:${state.listenersOpus})`);
       },
-      cancel() { state.clients.delete(clientId); httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`); },
-    }, { highWaterMark: config.lowLatency ? 16 * 1024 : config.preBufferBytes + 256 * 1024 });
-    req.signal.addEventListener("abort", () => { state.clients.delete(clientId); });
+      cancel() {
+        state.clients.delete(clientId);
+        state.mp3Clients.delete(clientId);
+        state.opusClients.delete(clientId);
+        state.listenersMp3 = state.mp3Clients.size;
+        state.listenersOpus = state.opusClients.size;
+        httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`);
+      },
+    }, {
+      highWaterMark: config.lowLatency ? 64 * 1024 : config.preBufferBytes + 256 * 1024,
+      size(chunk: Uint8Array) {
+        return chunk.byteLength;
+      },
+    });
+    req.signal.addEventListener("abort", () => {
+      state.clients.delete(clientId);
+      state.mp3Clients.delete(clientId);
+      state.opusClients.delete(clientId);
+      state.listenersMp3 = state.mp3Clients.size;
+      state.listenersOpus = state.opusClients.size;
+    });
     return new Response(stream, { headers: streamHeaders });
   }
 
@@ -230,8 +254,8 @@ async function getOrBuildAppJs(): Promise<string> {
     const masterAlive = state.masterProcess !== null;
     const opusAlive = state.opusProcess !== null;
     const sourceAlive = state.sourceProcess !== null;
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    const mp3Count = state.clients.size - opusCount;
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
     return Response.json({ status: "ok", uptime: uptimeSeconds, memory: { rss: Math.round(mem.rss/1024/1024), heapTotal: Math.round(mem.heapTotal/1024/1024), heapUsed: Math.round(mem.heapUsed/1024/1024), external: Math.round(mem.external/1024/1024) }, processes: { masterEncoder: masterAlive, opusTier: opusAlive, rtmpSource: sourceAlive }, broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, fallback: { active: fallbackActive, paused: state.fallbackPaused, currentTrack: state.currentTrack?.title || null }, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, tiers: { mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime }, opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null } }, { headers: corsHeaders() });
   }
   if (path === "/debug-state") {
@@ -239,12 +263,13 @@ async function getOrBuildAppJs(): Promise<string> {
   }
   if (path === "/status") {
     const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: state.clients.size - opusCount, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
+    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
-    const opusCount = [...state.clients.values()].filter(c=>c.tier==="opus").length;
-    const mp3Count = state.clients.size - opusCount;
+    const opusCount = state.listenersOpus;
+    const mp3Count = state.listenersMp3;
     const lines = ["# HELP radio_listeners Oyentes conectados actualmente","# TYPE radio_listeners gauge",`radio_listeners ${state.clients.size}`,"# HELP radio_listeners_mp3 Oyentes mp3","# TYPE radio_listeners_mp3 gauge",`radio_listeners_mp3 ${mp3Count}`,"# HELP radio_listeners_opus Oyentes opus tier","# TYPE radio_listeners_opus gauge",`radio_listeners_opus ${opusCount}`,"# HELP radio_broadcasting 1 si hay una fuente transmitiendo, 0 si no","# TYPE radio_broadcasting gauge",`radio_broadcasting ${state.isBroadcasting ? 1 : 0}`,"# HELP radio_bytes_received_total Bytes totales recibidos de la fuente","# TYPE radio_bytes_received_total counter",`radio_bytes_received_total ${state.totalBytesReceived}`,"# HELP radio_bytes_sent_total Bytes totales enviados a oyentes mp3","# TYPE radio_bytes_sent_total counter",`radio_bytes_sent_total ${state.totalBytesSent}`,"# HELP radio_bytes_sent_opus_total Bytes totales enviados opus tier","# TYPE radio_bytes_sent_opus_total counter",`radio_bytes_sent_opus_total ${state.totalBytesSentOpus}`,"# HELP radio_fallback_active 1 if fallback audio is playing, 0 otherwise","# TYPE radio_fallback_active gauge",`radio_fallback_active ${(!state.isBroadcasting && state.currentTrack !== null) ? 1 : 0}`,"# HELP radio_opus_tier_enabled 1 si opus tier habilitado","# TYPE radio_opus_tier_enabled gauge",`radio_opus_tier_enabled ${config.opusTierEnabled ? 1 : 0}`];
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }

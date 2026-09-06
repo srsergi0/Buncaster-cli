@@ -24,6 +24,10 @@ export type DeckState = "IDLE" | "PRELOADING" | "READY" | "PLAYING" | "CROSSFADI
 
 export const state = {
   clients: new Map<string, RadioClient>(),
+  mp3Clients: new Map<string, RadioClient>(),
+  opusClients: new Map<string, RadioClient>(),
+  listenersMp3: 0,
+  listenersOpus: 0,
   isBroadcasting: false,
   sourceConnected: false,
   sourceProcess: null as any | null,
