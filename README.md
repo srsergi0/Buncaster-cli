@@ -11,7 +11,7 @@ Professional broadcast radio server built with **Bun** and **FFmpeg**. Ingests l
 ### Option 1: Automated Installer (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/srsergi0/Buncaster/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/srsergi0/Buncaster-cli/main/install.sh | bash
 source ~/.bashrc
 bunradio
 ```
@@ -20,10 +20,10 @@ bunradio
 
 ```bash
 # With music folder mounted:
-docker run -p 8080:8080 -p 1936:1936/udp -v ./musica:/app/musica ghcr.io/srsergi0/buncaster:latest
+docker run -p 8080:8080 -p 1936:1936/udp -v ./musica:/app/musica ghcr.io/srsergi0/buncaster-cli:latest
 
 # Live-only (silence until you go live):
-docker run -p 8080:8080 -p 1936:1936/udp -e FALLBACK_SOURCE="" ghcr.io/srsergi0/buncaster:latest
+docker run -p 8080:8080 -p 1936:1936/udp -e FALLBACK_SOURCE="" ghcr.io/srsergi0/buncaster-cli:latest
 ```
 
 ### Option 3: From Source

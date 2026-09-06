@@ -2899,6 +2899,12 @@ async function getOrBuildAppJs(): Promise<string> {
 
   appJsBuilding = (async () => {
     try {
+      const prebuilt = Bun.file("public/app.js");
+      if (await prebuilt.exists()) {
+        const text = await prebuilt.text();
+        appJsCache = text;
+        return text;
+      }
       const build = await Bun.build({ entrypoints: ["src/web/App.tsx"], target: "browser", minify: false });
       if (!build.success || !build.outputs[0]) throw new Error("Build failed");
       const js = await build.outputs[0].text();

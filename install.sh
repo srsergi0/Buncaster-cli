@@ -2,14 +2,14 @@
 # =============================================================
 # BunRadio - Instalador rapido
 # =============================================================
-# Uso: curl -fsSL https://raw.githubusercontent.com/srsergi0/Buncaster/main/install.sh | bash
+# Uso: curl -fsSL https://raw.githubusercontent.com/srsergi0/Buncaster-cli/main/install.sh | bash
 # O:   bash install.sh
 # Soporta: Linux, macOS, Windows (WSL/Git Bash), Termux (Android)
 # =============================================================
 
 set -e
 
-REPO="srsergi0/Buncaster"
+REPO="srsergi0/Buncaster-cli"
 INSTALL_DIR="${BUNRADIO_DIR:-$HOME/.bunradio}"
 
 # Colores ANSI
