@@ -258,21 +258,60 @@ async function getOrBuildAppJs(): Promise<string> {
       return Response.json({ ok: true, message: f === "" ? "Live-only" : `Folder set to ${f}` }, { headers: corsHeaders() });
     } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
   }
+
+  // ---- Queue Endpoints ----
+  if (path === "/api/queue" && req.method === "GET") {
+    return Response.json({ ok: true, queue: state.fallbackQueue }, { headers: corsHeaders() });
+  }
+
   if (path === "/api/queue/add" && req.method === "POST") {
     try {
       const { file } = await req.json() as any;
       const f = String(file ?? "").trim();
       if (!f) throw new Error("file required");
-      const { state: st } = await import("./state");
       const { startFallback } = await import("./audio-router");
-      // @ts-ignore
-      st.fallbackQueue = (st as any).fallbackQueue || [];
-      // @ts-ignore
-      (st as any).fallbackQueue.push(f);
+      state.fallbackQueue = state.fallbackQueue || [];
+      state.fallbackQueue.push(f);
       try { startFallback(); } catch {}
-      return Response.json({ ok: true, message: `Added ${f.split("/").pop()}` }, { headers: corsHeaders() });
+      return Response.json({ ok: true, message: `Added ${f.split("/").pop()}`, queue: state.fallbackQueue }, { headers: corsHeaders() });
     } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
   }
+
+  if (path === "/api/queue/remove" && req.method === "POST") {
+    try {
+      const { index, file } = await req.json() as any;
+      state.fallbackQueue = state.fallbackQueue || [];
+      let removed: string | undefined;
+      if (typeof index === "number" && index >= 0 && index < state.fallbackQueue.length) {
+        [removed] = state.fallbackQueue.splice(index, 1);
+      } else if (file) {
+        const idx = state.fallbackQueue.indexOf(String(file));
+        if (idx !== -1) [removed] = state.fallbackQueue.splice(idx, 1);
+      }
+      return Response.json({ ok: true, removed, queue: state.fallbackQueue }, { headers: corsHeaders() });
+    } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
+  }
+
+  if (path === "/api/queue/clear" && req.method === "POST") {
+    state.fallbackQueue = [];
+    return Response.json({ ok: true, message: "Queue cleared", queue: [] }, { headers: corsHeaders() });
+  }
+
+  if (path === "/api/queue/move" && req.method === "POST") {
+    try {
+      const { from, to } = await req.json() as any;
+      state.fallbackQueue = state.fallbackQueue || [];
+      const f = Number(from);
+      const t = Number(to);
+      if (Number.isNaN(f) || f < 0 || f >= state.fallbackQueue.length || Number.isNaN(t) || t < 0 || t >= state.fallbackQueue.length) {
+        throw new Error("Invalid 'from' or 'to' index");
+      }
+      const [item] = state.fallbackQueue.splice(f, 1);
+      if (item) state.fallbackQueue.splice(t, 0, item);
+      return Response.json({ ok: true, queue: state.fallbackQueue }, { headers: corsHeaders() });
+    } catch (e: any) { return Response.json({ ok: false, message: String(e.message) }, { status: 500, headers: corsHeaders() }); }
+  }
+
   if (path === "/api/skip" && req.method === "POST") {
     try {
       const { actionSkipFallback } = await import("./audio-router");
@@ -317,6 +356,7 @@ async function getOrBuildAppJs(): Promise<string> {
         active: fallbackActive,
         paused: state.fallbackPaused,
         currentTrack: state.currentTrack?.title || null,
+        queue: state.fallbackQueue || [],
       },
       listeners: state.clients.size,
       listenersMp3: mp3Count,

@@ -41,7 +41,10 @@ function App() {
       ]);
       setStatus(s as any);
       setHealth(h as any);
-      if ((h as any)?.fallback) setFallback((h as any).fallback?.currentTrack || "");
+      if ((h as any)?.fallback) {
+        setFallback((h as any).fallback?.currentTrack || "");
+        setQueue((h as any).fallback?.queue || []);
+      }
     } catch {}
   };
 
