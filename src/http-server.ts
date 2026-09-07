@@ -2,6 +2,7 @@ import { config } from "./config";
 import { state } from "./state";
 import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
+import { getNowPlayingInfo, getCurrentTitle } from "./broadcaster";
 
 // Rutas literales: /mp3 (320k) y /opus (96k) — solo estas
 const STREAM_PATHS = new Set(["/mp3", "/opus"]);
@@ -176,9 +177,7 @@ async function getOrBuildAppJs(): Promise<string> {
         if (isOpus && opusHeaders) { try { controller.enqueue(opusHeaders); } catch {} }
         const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
         if (shouldSendPreBuffer) {
-          const currentTitle = state.currentTrack
-            ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
-            : "";
+          const currentTitle = getCurrentTitle();
           for (const chunk of chosenPreBuffer.snapshot()) {
             try {
               if (icyState) {
@@ -248,8 +247,25 @@ async function getOrBuildAppJs(): Promise<string> {
     }
   }
 
+  // ---- Public Now Playing Endpoints ----
+  if ((path === "/api/now-playing" || path === "/api/current-track") && req.method === "GET") {
+    const nowPlaying = getNowPlayingInfo();
+    return Response.json({
+      ok: true,
+      isLive: state.isBroadcasting,
+      nowPlaying,
+      currentTrack: nowPlaying.display,
+      title: nowPlaying.title,
+      artist: nowPlaying.artist,
+      duration: nowPlaying.duration,
+      elapsed: nowPlaying.elapsed,
+      remaining: nowPlaying.remaining,
+      progress: nowPlaying.progress,
+    }, { headers: corsHeaders() });
+  }
+
   // ---- Web API & Admin Endpoints (protected with checkAdminAuth) ----
-  if (path.startsWith("/api/") || path.startsWith("/admin/api/")) {
+  if ((path.startsWith("/api/") || path.startsWith("/admin/api/")) && path !== "/api/now-playing" && path !== "/api/current-track") {
     if (!checkAdminAuth(req)) {
       return unauthorized();
     }
@@ -358,10 +374,12 @@ async function getOrBuildAppJs(): Promise<string> {
       },
       broadcasting: state.isBroadcasting,
       sourceConnected: state.sourceConnected,
+      nowPlaying: getNowPlayingInfo(),
       fallback: {
         active: fallbackActive,
         paused: state.fallbackPaused,
-        currentTrack: state.currentTrack?.title || null,
+        currentTrack: getNowPlayingInfo().display,
+        track: getNowPlayingInfo(),
         queue: state.fallbackQueue || [],
       },
       listeners: state.clients.size,
@@ -396,7 +414,31 @@ async function getOrBuildAppJs(): Promise<string> {
     const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
-    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
+    const nowPlaying = getNowPlayingInfo();
+    return Response.json({
+      broadcasting: state.isBroadcasting,
+      sourceConnected: state.sourceConnected,
+      nowPlaying,
+      currentTrack: nowPlaying.display,
+      title: nowPlaying.title,
+      artist: nowPlaying.artist,
+      listeners: state.clients.size,
+      listenersMp3: mp3Count,
+      listenersOpus: opusCount,
+      maxListeners: config.maxListeners,
+      totalListenersServed: state.totalListenersServed,
+      totalBytesReceived: state.totalBytesReceived,
+      totalBytesSent: state.totalBytesSent,
+      totalBytesSentOpus: state.totalBytesSentOpus,
+      uptimeSeconds,
+      stationName: "BunRadio",
+      detectedBitrateKbps: state.detectedBitrateKbps,
+      detectedSampleRate: state.detectedSampleRate,
+      fallbackBitrateKbps: config.fallbackBitrateKbps,
+      opusTierBitrateKbps: config.opusTierBitrateKbps,
+      opusTierEnabled: config.opusTierEnabled,
+      fallbackActive: !state.isBroadcasting && state.currentTrack !== null
+    }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
     const opusCount = state.listenersOpus;

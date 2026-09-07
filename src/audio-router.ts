@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 import { config } from "./config";
 import { rtmpLog } from "./logger";
 import { state, type DeckState } from "./state";
@@ -1107,16 +1108,28 @@ export function startFallback() {
   currentDeck.buffer.clear();
   currentDeck.residueAcc.reset();
 
-  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
+  const basename = path.basename(fileToPlay);
+  const cleanName = basename.replace(/\.[^/.]+$/, "") || "Desconocido";
   rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track (Session ${session}): ${cleanName}`);
+
+  let parsedArtist = "";
+  let parsedTitle = cleanName;
+  if (cleanName.includes(" - ")) {
+    const parts = cleanName.split(" - ");
+    parsedArtist = parts[0]?.trim() || "";
+    parsedTitle = parts.slice(1).join(" - ").trim() || cleanName;
+  }
 
   getFileMetadata(fileToPlay).then((meta) => {
     if (currentDeck.sessionId !== session) return; // Callback obsoleto ignorado
 
+    const finalTitle = (meta.title && meta.title.trim()) || parsedTitle;
+    const finalArtist = (meta.artist && meta.artist.trim()) || parsedArtist || "Artista Desconocido";
+
     currentDeck.pendingTrackMeta = {
       file: fileToPlay,
-      title: meta.title || cleanName.replace(/\.[^/.]+$/, ""),
-      artist: meta.artist || "Artista Desconocido",
+      title: finalTitle,
+      artist: finalArtist,
       duration: meta.duration,
     };
 

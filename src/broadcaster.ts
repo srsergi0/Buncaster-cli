@@ -32,10 +32,86 @@ export function evictClient(id: string, reason: string): void {
   httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size} (mp3:${state.listenersMp3}, opus:${state.listenersOpus})`);
 }
 
-function getCurrentTitle(): string {
-  return state.currentTrack
-    ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
-    : "";
+export interface NowPlayingInfo {
+  type: "live" | "fallback" | "silence";
+  isLive: boolean;
+  display: string;
+  title: string;
+  artist: string;
+  file: string | null;
+  duration: number;
+  elapsed: number;
+  remaining: number;
+  progress: number;
+  startedAt: number | null;
+}
+
+export function getNowPlayingInfo(): NowPlayingInfo {
+  if (state.isBroadcasting) {
+    const elapsed = state.lastSourceAudioTimeMs > 0 ? Math.round((Date.now() - state.lastSourceAudioTimeMs) / 1000) : 0;
+    return {
+      type: "live",
+      isLive: true,
+      display: "LIVE - Transmisión en Vivo",
+      title: "Transmisión en Vivo",
+      artist: "OBS Studio",
+      file: null,
+      duration: 0,
+      elapsed,
+      remaining: 0,
+      progress: 1.0,
+      startedAt: state.lastSourceAudioTimeMs || Date.now(),
+    };
+  }
+
+  const track = state.currentTrack;
+  if (!track) {
+    return {
+      type: "silence",
+      isLive: false,
+      display: "Silencio (esperando transmisión o música)",
+      title: "Silencio",
+      artist: "BunRadio",
+      file: null,
+      duration: 0,
+      elapsed: 0,
+      remaining: 0,
+      progress: 0,
+      startedAt: null,
+    };
+  }
+
+  const now = Date.now();
+  const elapsed = Math.max(0, (now - track.startedAt) / 1000);
+  const duration = track.duration || 0;
+  const remaining = duration > 0 ? Math.max(0, duration - elapsed) : 0;
+  const progress = duration > 0 ? Math.min(1.0, elapsed / duration) : 0;
+
+  const artist = (track.artist || "").trim();
+  const title = (track.title || "").trim();
+  const display = (artist && title && artist !== "Artista Desconocido" && artist !== "Unknown Artist")
+    ? `${artist} - ${title}`
+    : (title || artist || "Pista Desconocida");
+
+  return {
+    type: "fallback",
+    isLive: false,
+    display,
+    title: title || display,
+    artist: (artist && artist !== "Artista Desconocido") ? artist : "",
+    file: track.file,
+    duration: Math.round(duration * 10) / 10,
+    elapsed: Math.round(elapsed * 10) / 10,
+    remaining: Math.round(remaining * 10) / 10,
+    progress: Math.round(progress * 1000) / 1000,
+    startedAt: track.startedAt,
+  };
+}
+
+export function getCurrentTitle(): string {
+  const info = getNowPlayingInfo();
+  if (info.type === "silence") return "";
+  return info.display;
 }
 
 export function broadcast(chunk: Uint8Array): void {

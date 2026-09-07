@@ -4,6 +4,7 @@
 
 ```ts
 import fs from "fs";
+import path from "path";
 import { config } from "./config";
 import { rtmpLog } from "./logger";
 import { state, type DeckState } from "./state";
@@ -1112,16 +1113,28 @@ export function startFallback() {
   currentDeck.buffer.clear();
   currentDeck.residueAcc.reset();
 
-  const cleanName = fileToPlay.split("/").pop() || "Desconocido";
+  const basename = path.basename(fileToPlay);
+  const cleanName = basename.replace(/\.[^/.]+$/, "") || "Desconocido";
   rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track (Session ${session}): ${cleanName}`);
+
+  let parsedArtist = "";
+  let parsedTitle = cleanName;
+  if (cleanName.includes(" - ")) {
+    const parts = cleanName.split(" - ");
+    parsedArtist = parts[0]?.trim() || "";
+    parsedTitle = parts.slice(1).join(" - ").trim() || cleanName;
+  }
 
   getFileMetadata(fileToPlay).then((meta) => {
     if (currentDeck.sessionId !== session) return; // Callback obsoleto ignorado
 
+    const finalTitle = (meta.title && meta.title.trim()) || parsedTitle;
+    const finalArtist = (meta.artist && meta.artist.trim()) || parsedArtist || "Artista Desconocido";
+
     currentDeck.pendingTrackMeta = {
       file: fileToPlay,
-      title: meta.title || cleanName.replace(/\.[^/.]+$/, ""),
-      artist: meta.artist || "Artista Desconocido",
+      title: finalTitle,
+      artist: finalArtist,
       duration: meta.duration,
     };
 
@@ -1818,10 +1831,86 @@ export function evictClient(id: string, reason: string): void {
   httpLog.info(`Listener ${id} disconnected (${reason}). Active: ${state.clients.size} (mp3:${state.listenersMp3}, opus:${state.listenersOpus})`);
 }
 
-function getCurrentTitle(): string {
-  return state.currentTrack
-    ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
-    : "";
+export interface NowPlayingInfo {
+  type: "live" | "fallback" | "silence";
+  isLive: boolean;
+  display: string;
+  title: string;
+  artist: string;
+  file: string | null;
+  duration: number;
+  elapsed: number;
+  remaining: number;
+  progress: number;
+  startedAt: number | null;
+}
+
+export function getNowPlayingInfo(): NowPlayingInfo {
+  if (state.isBroadcasting) {
+    const elapsed = state.lastSourceAudioTimeMs > 0 ? Math.round((Date.now() - state.lastSourceAudioTimeMs) / 1000) : 0;
+    return {
+      type: "live",
+      isLive: true,
+      display: "LIVE - Transmisión en Vivo",
+      title: "Transmisión en Vivo",
+      artist: "OBS Studio",
+      file: null,
+      duration: 0,
+      elapsed,
+      remaining: 0,
+      progress: 1.0,
+      startedAt: state.lastSourceAudioTimeMs || Date.now(),
+    };
+  }
+
+  const track = state.currentTrack;
+  if (!track) {
+    return {
+      type: "silence",
+      isLive: false,
+      display: "Silencio (esperando transmisión o música)",
+      title: "Silencio",
+      artist: "BunRadio",
+      file: null,
+      duration: 0,
+      elapsed: 0,
+      remaining: 0,
+      progress: 0,
+      startedAt: null,
+    };
+  }
+
+  const now = Date.now();
+  const elapsed = Math.max(0, (now - track.startedAt) / 1000);
+  const duration = track.duration || 0;
+  const remaining = duration > 0 ? Math.max(0, duration - elapsed) : 0;
+  const progress = duration > 0 ? Math.min(1.0, elapsed / duration) : 0;
+
+  const artist = (track.artist || "").trim();
+  const title = (track.title || "").trim();
+  const display = (artist && title && artist !== "Artista Desconocido" && artist !== "Unknown Artist")
+    ? `${artist} - ${title}`
+    : (title || artist || "Pista Desconocida");
+
+  return {
+    type: "fallback",
+    isLive: false,
+    display,
+    title: title || display,
+    artist: (artist && artist !== "Artista Desconocido") ? artist : "",
+    file: track.file,
+    duration: Math.round(duration * 10) / 10,
+    elapsed: Math.round(elapsed * 10) / 10,
+    remaining: Math.round(remaining * 10) / 10,
+    progress: Math.round(progress * 1000) / 1000,
+    startedAt: track.startedAt,
+  };
+}
+
+export function getCurrentTitle(): string {
+  const info = getNowPlayingInfo();
+  if (info.type === "silence") return "";
+  return info.display;
 }
 
 export function broadcast(chunk: Uint8Array): void {
@@ -2826,6 +2915,7 @@ import { config } from "./config";
 import { state } from "./state";
 import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
+import { getNowPlayingInfo, getCurrentTitle } from "./broadcaster";
 
 // Rutas literales: /mp3 (320k) y /opus (96k) — solo estas
 const STREAM_PATHS = new Set(["/mp3", "/opus"]);
@@ -3000,9 +3090,7 @@ async function getOrBuildAppJs(): Promise<string> {
         if (isOpus && opusHeaders) { try { controller.enqueue(opusHeaders); } catch {} }
         const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
         if (shouldSendPreBuffer) {
-          const currentTitle = state.currentTrack
-            ? `${state.currentTrack.artist} - ${state.currentTrack.title}`
-            : "";
+          const currentTitle = getCurrentTitle();
           for (const chunk of chosenPreBuffer.snapshot()) {
             try {
               if (icyState) {
@@ -3072,8 +3160,25 @@ async function getOrBuildAppJs(): Promise<string> {
     }
   }
 
+  // ---- Public Now Playing Endpoints ----
+  if ((path === "/api/now-playing" || path === "/api/current-track") && req.method === "GET") {
+    const nowPlaying = getNowPlayingInfo();
+    return Response.json({
+      ok: true,
+      isLive: state.isBroadcasting,
+      nowPlaying,
+      currentTrack: nowPlaying.display,
+      title: nowPlaying.title,
+      artist: nowPlaying.artist,
+      duration: nowPlaying.duration,
+      elapsed: nowPlaying.elapsed,
+      remaining: nowPlaying.remaining,
+      progress: nowPlaying.progress,
+    }, { headers: corsHeaders() });
+  }
+
   // ---- Web API & Admin Endpoints (protected with checkAdminAuth) ----
-  if (path.startsWith("/api/") || path.startsWith("/admin/api/")) {
+  if ((path.startsWith("/api/") || path.startsWith("/admin/api/")) && path !== "/api/now-playing" && path !== "/api/current-track") {
     if (!checkAdminAuth(req)) {
       return unauthorized();
     }
@@ -3182,10 +3287,12 @@ async function getOrBuildAppJs(): Promise<string> {
       },
       broadcasting: state.isBroadcasting,
       sourceConnected: state.sourceConnected,
+      nowPlaying: getNowPlayingInfo(),
       fallback: {
         active: fallbackActive,
         paused: state.fallbackPaused,
-        currentTrack: state.currentTrack?.title || null,
+        currentTrack: getNowPlayingInfo().display,
+        track: getNowPlayingInfo(),
         queue: state.fallbackQueue || [],
       },
       listeners: state.clients.size,
@@ -3220,7 +3327,31 @@ async function getOrBuildAppJs(): Promise<string> {
     const uptimeSeconds = Math.floor((Date.now() - state.startTime.getTime()) / 1000);
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
-    return Response.json({ broadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, listeners: state.clients.size, listenersMp3: mp3Count, listenersOpus: opusCount, maxListeners: config.maxListeners, totalListenersServed: state.totalListenersServed, totalBytesReceived: state.totalBytesReceived, totalBytesSent: state.totalBytesSent, totalBytesSentOpus: state.totalBytesSentOpus, uptimeSeconds, stationName: "BunRadio", detectedBitrateKbps: state.detectedBitrateKbps, detectedSampleRate: state.detectedSampleRate, fallbackBitrateKbps: config.fallbackBitrateKbps, opusTierBitrateKbps: config.opusTierBitrateKbps, opusTierEnabled: config.opusTierEnabled, fallbackActive: !state.isBroadcasting && state.currentTrack !== null }, { headers: corsHeaders() });
+    const nowPlaying = getNowPlayingInfo();
+    return Response.json({
+      broadcasting: state.isBroadcasting,
+      sourceConnected: state.sourceConnected,
+      nowPlaying,
+      currentTrack: nowPlaying.display,
+      title: nowPlaying.title,
+      artist: nowPlaying.artist,
+      listeners: state.clients.size,
+      listenersMp3: mp3Count,
+      listenersOpus: opusCount,
+      maxListeners: config.maxListeners,
+      totalListenersServed: state.totalListenersServed,
+      totalBytesReceived: state.totalBytesReceived,
+      totalBytesSent: state.totalBytesSent,
+      totalBytesSentOpus: state.totalBytesSentOpus,
+      uptimeSeconds,
+      stationName: "BunRadio",
+      detectedBitrateKbps: state.detectedBitrateKbps,
+      detectedSampleRate: state.detectedSampleRate,
+      fallbackBitrateKbps: config.fallbackBitrateKbps,
+      opusTierBitrateKbps: config.opusTierBitrateKbps,
+      opusTierEnabled: config.opusTierEnabled,
+      fallbackActive: !state.isBroadcasting && state.currentTrack !== null
+    }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
     const opusCount = state.listenersOpus;
@@ -4423,13 +4554,17 @@ function App() {
         <div>
           <div style={{ fontSize: 12, letterSpacing: 1, color: NEON.cyan, fontWeight: 700, marginBottom: 8 }}>♫ NOW PLAYING</div>
           <div style={{ fontSize: 28, fontWeight: 800, color: "white", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {status?.fallbackActive ? (health?.fallback?.currentTrack || "—") : isLive ? "🔴 LIVE" : "🔇 Silence"}
+            {status?.fallbackActive ? (health?.nowPlaying?.display || health?.fallback?.currentTrack || "—") : isLive ? "🔴 LIVE" : "🔇 Silence"}
           </div>
           <div style={{ color: NEON.grey, fontSize: 13, marginTop: 4 }}>
-            {isLive ? "Live from OBS • SRT" : health?.fallback?.currentTrack ? `File • ${health.fallback.currentTrack}` : "Live-only • silence until OBS"}
+            {isLive
+              ? "Live from OBS • SRT Ingest Active"
+              : health?.nowPlaying?.duration
+                ? `${health.nowPlaying.artist ? `${health.nowPlaying.artist} • ` : ""}${Math.floor((health.nowPlaying.elapsed || 0) / 60)}:${String(Math.floor((health.nowPlaying.elapsed || 0) % 60)).padStart(2, '0')} / ${Math.floor((health.nowPlaying.duration || 0) / 60)}:${String(Math.floor((health.nowPlaying.duration || 0) % 60)).padStart(2, '0')}`
+                : health?.fallback?.currentTrack ? `Track • ${health.fallback.currentTrack}` : "Live-only • silence until OBS"}
           </div>
           <div style={{ marginTop: 16, height: 6, background: "#0f1419", borderRadius: 6, overflow: "hidden", border: `1px solid ${NEON.bg}` }}>
-            <div style={{ height: "100%", width: `${status?.fallbackActive && health?.fallback?.currentTrack ? 42 : isLive ? 100 : 6}%`, background: isLive ? NEON.red : NEON.cyan, transition: "width 0.5s ease" }} />
+            <div style={{ height: "100%", width: `${status?.fallbackActive && health?.nowPlaying ? Math.round((health.nowPlaying.progress || 0) * 100) : isLive ? 100 : 0}%`, background: isLive ? NEON.red : NEON.cyan, transition: "width 0.5s ease" }} />
           </div>
           <div style={{ display: "flex", gap: 12, marginTop: 12, fontSize: 12, color: NEON.grey }}>
             <span>MP3 320k</span><span>•</span><span>OPUS 96k eco</span><span>•</span><span style={{ color: dotColor }}>{dot}</span>
@@ -4441,7 +4576,7 @@ function App() {
           <a href="/opus" target="_blank" style={{ display: "block", background: NEON.magenta, color: "white", textAlign: "center", padding: "12px 0", borderRadius: 8, fontWeight: 800, textDecoration: "none" }}>♫  OPUS  ·  96k</a>
           <div style={{ fontSize: 11, color: NEON.grey, marginTop: 12, lineHeight: 1.5 }}>
             SRT ingest<br />
-            <code style={{ background: "#0f1419", padding: "2px 6px", borderRadius: 4, color: NEON.cyan, fontSize: 11 }}>srt://localhost:1936?streamid=live/...</code><br />
+            <code style={{ background: "#0f1419", padding: "2px 6px", borderRadius: 4, color: NEON.cyan, fontSize: 11 }}>srt://127.0.0.1:1936?streamid=live/...</code><br />
             OBS → Service: Custom → Server: above
           </div>
         </div>

@@ -113,13 +113,17 @@ function App() {
         <div>
           <div style={{ fontSize: 12, letterSpacing: 1, color: NEON.cyan, fontWeight: 700, marginBottom: 8 }}>♫ NOW PLAYING</div>
           <div style={{ fontSize: 28, fontWeight: 800, color: "white", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {status?.fallbackActive ? (health?.fallback?.currentTrack || "—") : isLive ? "🔴 LIVE" : "🔇 Silence"}
+            {status?.fallbackActive ? (health?.nowPlaying?.display || health?.fallback?.currentTrack || "—") : isLive ? "🔴 LIVE" : "🔇 Silence"}
           </div>
           <div style={{ color: NEON.grey, fontSize: 13, marginTop: 4 }}>
-            {isLive ? "Live from OBS • SRT" : health?.fallback?.currentTrack ? `File • ${health.fallback.currentTrack}` : "Live-only • silence until OBS"}
+            {isLive
+              ? "Live from OBS • SRT Ingest Active"
+              : health?.nowPlaying?.duration
+                ? `${health.nowPlaying.artist ? `${health.nowPlaying.artist} • ` : ""}${Math.floor((health.nowPlaying.elapsed || 0) / 60)}:${String(Math.floor((health.nowPlaying.elapsed || 0) % 60)).padStart(2, '0')} / ${Math.floor((health.nowPlaying.duration || 0) / 60)}:${String(Math.floor((health.nowPlaying.duration || 0) % 60)).padStart(2, '0')}`
+                : health?.fallback?.currentTrack ? `Track • ${health.fallback.currentTrack}` : "Live-only • silence until OBS"}
           </div>
           <div style={{ marginTop: 16, height: 6, background: "#0f1419", borderRadius: 6, overflow: "hidden", border: `1px solid ${NEON.bg}` }}>
-            <div style={{ height: "100%", width: `${status?.fallbackActive && health?.fallback?.currentTrack ? 42 : isLive ? 100 : 6}%`, background: isLive ? NEON.red : NEON.cyan, transition: "width 0.5s ease" }} />
+            <div style={{ height: "100%", width: `${status?.fallbackActive && health?.nowPlaying ? Math.round((health.nowPlaying.progress || 0) * 100) : isLive ? 100 : 0}%`, background: isLive ? NEON.red : NEON.cyan, transition: "width 0.5s ease" }} />
           </div>
           <div style={{ display: "flex", gap: 12, marginTop: 12, fontSize: 12, color: NEON.grey }}>
             <span>MP3 320k</span><span>•</span><span>OPUS 96k eco</span><span>•</span><span style={{ color: dotColor }}>{dot}</span>
@@ -131,7 +135,7 @@ function App() {
           <a href="/opus" target="_blank" style={{ display: "block", background: NEON.magenta, color: "white", textAlign: "center", padding: "12px 0", borderRadius: 8, fontWeight: 800, textDecoration: "none" }}>♫  OPUS  ·  96k</a>
           <div style={{ fontSize: 11, color: NEON.grey, marginTop: 12, lineHeight: 1.5 }}>
             SRT ingest<br />
-            <code style={{ background: "#0f1419", padding: "2px 6px", borderRadius: 4, color: NEON.cyan, fontSize: 11 }}>srt://localhost:1936?streamid=live/...</code><br />
+            <code style={{ background: "#0f1419", padding: "2px 6px", borderRadius: 4, color: NEON.cyan, fontSize: 11 }}>srt://127.0.0.1:1936?streamid=live/...</code><br />
             OBS → Service: Custom → Server: above
           </div>
         </div>

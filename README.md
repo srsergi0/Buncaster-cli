@@ -97,6 +97,7 @@ http://localhost:8080/stream?format=opus  # Query parameter selector
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/stream` (or `/mp3`, `/opus`) | GET | Public | Continuous live audio stream |
+| `/api/now-playing` | GET | Public | Current track metadata, artist, title, progress & duration |
 | `/health` | GET | Public | Health check with RAM usage, process state, and diagnostics |
 | `/status` | GET | Public | Real-time station metrics (JSON) |
 | `/metrics` | GET | Public | Prometheus-compatible metrics |
