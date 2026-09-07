@@ -44,13 +44,16 @@ jobs:
         run: |
           OWNER="${{ github.repository_owner }}"
           REPO="${{ github.repository }}"
-          # Default to buncaster (production Bloom service) and buncaster-cli
-          TARGETS="ghcr.io/${OWNER,,}/buncaster"
-          if [ "${REPO,,}" != "${OWNER,,}/buncaster" ]; then
-            TARGETS="${TARGETS}\nghcr.io/${REPO,,}"
-          fi
           if [ -n "${{ inputs.image_name }}" ]; then
             TARGETS="ghcr.io/${{ inputs.image_name }}"
+          elif [ "${REPO,,}" = "${OWNER,,}/buncaster-cli" ]; then
+            # Fork CLI only pushes its own image (no permission to overwrite buncaster)
+            TARGETS="ghcr.io/${REPO,,}"
+          else
+            TARGETS="ghcr.io/${OWNER,,}/buncaster"
+            if [ "${REPO,,}" != "${OWNER,,}/buncaster" ]; then
+              TARGETS="${TARGETS}\nghcr.io/${REPO,,}"
+            fi
           fi
           echo -e "targets<<EOF\n${TARGETS}\nEOF" >> $GITHUB_OUTPUT
 
