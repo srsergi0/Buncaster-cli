@@ -6,7 +6,7 @@ on:
       image_name:
         description: 'Target image name in ghcr.io (e.g. srsergi0/buncaster or srsergi0/buncaster-cli)'
         required: false
-        default: 'srsergi0/buncaster'
+        default: 'srsergi0/buncaster-cli'
   push:
     branches: [main]
     tags: ['v*']
