@@ -4,7 +4,7 @@ import { rtmpLog } from "./logger";
 // ======================================================// Wrapper Bun.FFI sobre libmp3lame.so — encoding MP3 sin ffmpeg
 // ======================================================// Llama directamente a la librería C compartida del sistema,
 // sin spawn de procesos, sin pipes stdin/stdout. Esto elimina
-// el proceso master ffmpeg (~100MB RSS, ~45% CPU con loudnorm).
+// el proceso master ffmpeg (~100MB RSS).
 //
 // La librería ya está en el contenedor: /usr/lib/libmp3lame.so.0
 // (instalada como dependencia de `apk add ffmpeg`).

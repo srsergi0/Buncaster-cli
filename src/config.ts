@@ -16,7 +16,6 @@ export interface Config {
   logLevel: LogLevel;
   fallbackBitrateKbps: number;
   fallbackSource: string;
-  audioProcessing: boolean;
   crossfadeSeconds: number;
   crossfadeLiveSeconds: number;
   rtmpStreamKey: string;
@@ -104,7 +103,6 @@ function loadConfig(): Config {
     logLevel: (process.env.LOG_LEVEL as LogLevel) || "info",
     fallbackBitrateKbps: envInt("STREAM_BITRATE_KBPS", 320),
     fallbackSource: process.env.FALLBACK_SOURCE !== undefined ? process.env.FALLBACK_SOURCE : "",
-    audioProcessing: envBool("AUDIO_PROCESSING", false),
     crossfadeSeconds: envFloat("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
     crossfadeLiveSeconds: envFloat("CROSSFADE_LIVE_SECONDS", lowLatency ? 0.2 : 2),
     rtmpStreamKey: rtmpKey,

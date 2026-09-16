@@ -12,7 +12,7 @@ Radio por internet: ingesta RTMP (OBS) + transcodificación nativa (LAME-FFI + d
 ## Variables de entorno clave
 
 - `PORT`, `RTMP_PORT`, `MAX_LISTENERS`, `PREBUFFER_BYTES` (1.5MB para arranque instantáneo)
-- `STREAM_BITRATE_KBPS`, `AUDIO_PROCESSING`, `CROSSFADE_SECONDS`, `FALLBACK_SOURCE`
+- `STREAM_BITRATE_KBPS`, `CROSSFADE_SECONDS`, `FALLBACK_SOURCE`
 - `USE_NATIVE_LAME=auto` (encoder MP3 in-process), `USE_NATIVE_DECODE=auto` (decode in-process)
 - `ADMIN_USER`/`ADMIN_PASSWORD` (panel), `CORS_ORIGIN`
 - `RTMP_MIN_LIVE_SECONDS` (segundos de audio sostenido antes de pasar a "en vivo")
