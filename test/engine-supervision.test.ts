@@ -14,15 +14,33 @@ import { PreBuffer } from "../src/pre-buffer";
 // Inyección de fallos (SRE): se simulan deck colgado y encoder opus colgado/caído
 // y se verifica que la supervisión actúa, sin depender de ffmpeg en el entorno de test.
 
-// El watchdog muta el singleton global `state` (p. ej. deckState al reiniciar un deck).
-// Restauramos tras cada test para no contaminar otros archivos según el orden de ejecución.
-let deckStateSnapshot: typeof state.deckState;
+// Estos tests mutan el singleton global `state`. Si un valor queda "viejo" (p. ej.
+// lastPcmSampleTimeMs), el watchdog real (setInterval arrancado por otros archivos de
+// test) cree que hay aire muerto y arranca un deck de verdad → contamina otros tests
+// de forma dependiente del tiempo. Guardamos y restauramos todo lo que tocamos.
+type Snapshot = Pick<
+  typeof state,
+  "lastPcmSampleTimeMs" | "isBroadcasting" | "fallbackPaused" | "shuttingDown" | "opusProcess"
+> & { deckState: typeof state.deckState };
+let snapshot: Snapshot;
 beforeEach(() => {
-  deckStateSnapshot = { ...state.deckState };
+  snapshot = {
+    lastPcmSampleTimeMs: state.lastPcmSampleTimeMs,
+    isBroadcasting: state.isBroadcasting,
+    fallbackPaused: state.fallbackPaused,
+    shuttingDown: state.shuttingDown,
+    opusProcess: state.opusProcess,
+    deckState: { ...state.deckState },
+  };
 });
 afterEach(() => {
-  state.deckState.A = deckStateSnapshot.A;
-  state.deckState.B = deckStateSnapshot.B;
+  state.lastPcmSampleTimeMs = snapshot.lastPcmSampleTimeMs;
+  state.isBroadcasting = snapshot.isBroadcasting;
+  state.fallbackPaused = snapshot.fallbackPaused;
+  state.shuttingDown = snapshot.shuttingDown;
+  state.opusProcess = snapshot.opusProcess;
+  state.deckState.A = snapshot.deckState.A;
+  state.deckState.B = snapshot.deckState.B;
 });
 
 describe("Fallback stall watchdog (FALLBACK_STALL_SECONDS)", () => {
