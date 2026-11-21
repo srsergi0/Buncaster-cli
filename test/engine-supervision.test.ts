@@ -5,6 +5,7 @@ import {
   accountAirTime,
   checkFallbackWatchdog,
   checkOpusStall,
+  OPUS_BACKOFF_MAX_MS,
   scheduleOpusRestart,
   stopOpusEncoder,
 } from "../src/audio-router";
@@ -103,12 +104,15 @@ describe("Opus encoder supervision (ENCODER_SUPERVISION)", () => {
 
   it("schedules restarts with exponential backoff and stopOpusEncoder cancels them", () => {
     state.shuttingDown = false;
+    // Otros archivos de test pueden haber intentado arrancar el encoder (sin ffmpeg en el
+    // runner falla el spawn y queda un reintento programado): partimos de cero.
+    stopOpusEncoder();
     const d1 = scheduleOpusRestart("test crash 1");
     stopOpusEncoder();
     const d2 = scheduleOpusRestart("test crash 2");
     stopOpusEncoder();
     expect(d1).not.toBeNull();
-    expect(d2).toBe(d1! * 2);
+    expect(d2).toBe(Math.min(OPUS_BACKOFF_MAX_MS, d1! * 2));
   });
 });
 

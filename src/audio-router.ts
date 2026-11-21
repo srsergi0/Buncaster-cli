@@ -1157,7 +1157,7 @@ let opusRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let opusBackoffMs = 1000;
 let opusStartedAtMs = 0;
 let opusLastOutputMs = 0;
-const OPUS_BACKOFF_MAX_MS = 30_000;
+export const OPUS_BACKOFF_MAX_MS = 30_000;
 const OPUS_HEALTHY_RESET_MS = 60_000;
 export const OPUS_STALL_MS = 10_000;
 
