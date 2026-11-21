@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { state } from "../src/state";
 import { config, prebufferBytesFor } from "../src/config";
 import {
@@ -13,6 +13,17 @@ import { PreBuffer } from "../src/pre-buffer";
 
 // Inyección de fallos (SRE): se simulan deck colgado y encoder opus colgado/caído
 // y se verifica que la supervisión actúa, sin depender de ffmpeg en el entorno de test.
+
+// El watchdog muta el singleton global `state` (p. ej. deckState al reiniciar un deck).
+// Restauramos tras cada test para no contaminar otros archivos según el orden de ejecución.
+let deckStateSnapshot: typeof state.deckState;
+beforeEach(() => {
+  deckStateSnapshot = { ...state.deckState };
+});
+afterEach(() => {
+  state.deckState.A = deckStateSnapshot.A;
+  state.deckState.B = deckStateSnapshot.B;
+});
 
 describe("Fallback stall watchdog (FALLBACK_STALL_SECONDS)", () => {
   it("restarts the fallback when no PCM reached the encoder for N seconds", () => {
