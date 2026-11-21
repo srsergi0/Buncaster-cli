@@ -373,7 +373,7 @@ MOQ_ENABLED=true
 MOQ_RELAY_URL=http://moq-relay:4434
 MOQ_PUBLIC_URL=https://185.139.1.222:4433
 MOQ_CERT_NAMES=185.139.1.222,localhost
-MOQ_FALLBACK_URL=https://radio-bloom.taptapp.xyz/radiobloom.mp3   # la URL que la web ya usa hoy
+MOQ_FALLBACK_URL=https://radio.tceoslabs.com/radiobloom.opus   # el tier MP3 está apagado en producción (404); usar el Opus
 ```
 
 ### 7.4 Cortafuegos
