@@ -24,6 +24,7 @@ import {
   stopMasterEncoder,
   stopPlaylistWatcher,
   stopAudioWatchdog,
+  mp3ListenerJoined,
 } from "./audio-router";
 import { flushLogsSync } from "./logger";
 import { audioClockDriftSeconds } from "./audio-router";
@@ -131,6 +132,18 @@ function engineStatus() {
       truncated: state.crossfadesTruncated,
       handoverBufferedBytes: state.handoverDrainedBytes,
       underrunBytes: state.crossfadeUnderrunBytes,
+    },
+    bunWay: {
+      encoderBatchMs: config.encoderBatchMs,
+      nativeDecode: config.useNativeDecode,
+      deckDecodesNative: state.deckDecodesNative,
+      deckDecodesFfmpeg: state.deckDecodesFfmpeg,
+      mp3OnDemand: config.mp3OnDemand,
+      mp3EncoderMode: state.mp3EncoderMode,
+      mp3EncoderWakeups: state.mp3EncoderWakeups,
+      srtOnDemand: config.srtOnDemand,
+      srtArmed: state.srtArmed,
+      srtWakeups: state.srtWakeups,
     },
     supervision: {
       enabled: config.encoderSupervision,
@@ -251,6 +264,7 @@ function engineStatus() {
         state.clients.set(clientId, clientObj);
         if (tier === "mp3") {
           state.mp3Clients.set(clientId, clientObj);
+          mp3ListenerJoined(); // MP3_ON_DEMAND: despierta LAME y le manda el historial
         } else {
           state.opusClients.set(clientId, clientObj);
         }
@@ -589,6 +603,22 @@ function engineStatus() {
       "# HELP radio_audio_clock_drift_seconds Audio emitido menos tiempo de pared (positivo = más rápido que tiempo real)",
       "# TYPE radio_audio_clock_drift_seconds gauge",
       `radio_audio_clock_drift_seconds ${audioClockDriftSeconds().toFixed(3)}`,
+      "# HELP radio_deck_decodes_total Pistas iniciadas por motor de decodificación (native = libavcodec FFI en proceso)",
+      "# TYPE radio_deck_decodes_total counter",
+      `radio_deck_decodes_total{engine="native"} ${state.deckDecodesNative}`,
+      `radio_deck_decodes_total{engine="ffmpeg"} ${state.deckDecodesFfmpeg}`,
+      "# HELP radio_mp3_encoder_active 1 si LAME está codificando (MP3_ON_DEMAND lo para sin oyentes /mp3)",
+      "# TYPE radio_mp3_encoder_active gauge",
+      `radio_mp3_encoder_active ${state.mp3EncoderMode === "idle" ? 0 : 1}`,
+      "# HELP radio_mp3_encoder_wakeups_total Veces que MP3_ON_DEMAND despertó LAME",
+      "# TYPE radio_mp3_encoder_wakeups_total counter",
+      `radio_mp3_encoder_wakeups_total ${state.mp3EncoderWakeups}`,
+      "# HELP radio_srt_armed 1 si SRT_ON_DEMAND espera al emisor con un socket UDP (sin ffmpeg)",
+      "# TYPE radio_srt_armed gauge",
+      `radio_srt_armed ${state.srtArmed ? 1 : 0}`,
+      "# HELP radio_srt_wakeups_total Paquetes que despertaron el listener SRT bajo demanda",
+      "# TYPE radio_srt_wakeups_total counter",
+      `radio_srt_wakeups_total ${state.srtWakeups}`,
     ];
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }

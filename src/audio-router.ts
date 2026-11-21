@@ -9,7 +9,7 @@ import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
 import { NativeDecoder, isNativeDecodeAvailable } from "./decode-ffi";
 import { FORMAT_CONFIG } from "./format-config";
 import { Event, ErrorCode, missingBinaryCode } from "./events";
-import { preBufferOpus } from "./pre-buffer";
+import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { OggPageAssembler, OpusHeaderCollector } from "./ogg";
 import { analysisEnabled, getCachedAnalysis, planTrack, requestAnalysis, type TrackPlan } from "./track-analysis";
 
@@ -196,6 +196,7 @@ export let isStoppingFallback = false;
 
 // Encoder nativo (LAME-FFI). Si está activo, reemplaza proceso master ffmpeg.
 let nativeEncoder: { encoder: LameEncoder } | null = null;
+let nativeDecodeAnnounced = false;
 
 function shuffle(array: string[]) {
   for (let i = array.length - 1; i > 0; i--) {
@@ -371,6 +372,136 @@ export function audioClockDriftSeconds(now = Date.now()): number {
   return state.audioSamplesProduced / SAMPLE_RATE - (now - firstPcmTimeMs) / 1000;
 }
 
+// =============================================================
+// LOTE DE PCM HACIA LOS ENCODERS (ENCODER_BATCH_MS) — "Bun way"
+// -------------------------------------------------------------
+// Los decks entregan PCM en trozos de ~26 ms (un frame MP3 decodificado).
+// Pasar cada trozo al encoder costaba 1 write al pipe de ffmpeg-opus, 1
+// llamada FFI a LAME y 1 broadcast (= 1 sendto por oyente /mp3) por trozo.
+// Agrupando en 100 ms: mismos bytes de salida, 4× menos syscalls.
+// =============================================================
+const ENC_BATCH_BYTES = Math.round(config.encoderBatchMs * 48) * 4; // frames × 4 B
+const encBatch: Uint8Array | null = ENC_BATCH_BYTES > 0 ? new Uint8Array(ENC_BATCH_BYTES) : null;
+let encBatchFill = 0;
+
+function encodeMp3(aligned: Uint8Array) {
+  if (!nativeEncoder) return;
+  const pcm = new Int16Array(aligned.buffer, aligned.byteOffset, aligned.byteLength >> 1);
+  const mp3 = nativeEncoder.encoder.encode(pcm);
+  if (mp3.length > 0) {
+    bitrateDetector.feed(mp3);
+    broadcast(mp3);
+  }
+}
+
+// =============================================================
+// MP3 BAJO DEMANDA (MP3_ON_DEMAND) — no codificar para nadie
+// -------------------------------------------------------------
+// En Bloom todo el tráfico va por /opus (el publisher); LAME 320k q2
+// gastaba ~3,3 % de un núcleo 24/7 (74 % de la CPU del proceso) para 0
+// oyentes. Con la flag: se guarda un historial PCM (anillo contiguo de
+// tantos segundos como el prebuffer mp3) y, sin oyentes /mp3 durante
+// MP3_IDLE_GRACE_MS, se deja de codificar. Al conectar uno, un encoder
+// LAME nuevo codifica el historial a ~30× tiempo real en rodajas de 0,25 s
+// (cediendo el event loop) y luego sigue en vivo: el oyente recibe la
+// misma ráfaga de prebuffer que hoy, solo que codificada en ese momento.
+// =============================================================
+const MP3_IDLE_GRACE_MS = 30_000;
+// 0,25 s de audio por rodaja ≈ 9 ms de LAME: con rodajas de 1 s (35 ms) el TTFB p99 de
+// una oleada de 200 conexiones durante el despertar subía de ~210 a ~390 ms (medido).
+const MP3_WARM_SLICE_BYTES = 48_000;
+let mp3WarmGeneration = 0; // invalida rodajas pendientes de un calentamiento anterior
+
+/** Anillo de bytes contiguo con posiciones absolutas (sin asignaciones por escritura). */
+export class PcmHistory {
+  private readonly buf: Uint8Array;
+  /** Bytes escritos en total (posición absoluta de la cabeza). */
+  total = 0;
+  constructor(capacityBytes: number) {
+    this.buf = new Uint8Array(Math.max(4, capacityBytes & ~3));
+  }
+  get capacity(): number { return this.buf.length; }
+  get oldest(): number { return Math.max(0, this.total - this.buf.length); }
+  write(data: Uint8Array): void {
+    const cap = this.buf.length;
+    const src = data.byteLength > cap ? data.subarray(data.byteLength - cap) : data;
+    const skipped = data.byteLength - src.byteLength;
+    const pos = (this.total + skipped) % cap;
+    const first = Math.min(src.byteLength, cap - pos);
+    this.buf.set(src.subarray(0, first), pos);
+    if (first < src.byteLength) this.buf.set(src.subarray(first), 0);
+    this.total += data.byteLength;
+  }
+  /** Copia contigua de [from, from+n) (debe estar dentro de [oldest, total)). */
+  read(from: number, n: number): Uint8Array {
+    const cap = this.buf.length;
+    const out = new Uint8Array(n);
+    const pos = from % cap;
+    const first = Math.min(n, cap - pos);
+    out.set(this.buf.subarray(pos, pos + first), 0);
+    if (first < n) out.set(this.buf.subarray(0, n - first), first);
+    return out;
+  }
+}
+
+function mp3HistoryBytes(): number {
+  // Mismos segundos de audio que el prebuffer mp3 (mín. 0,5 s por el retardo de LAME)
+  const secs = Math.max(0.5, preBuffer.secondsFor(preBuffer.capacityBytes));
+  return Math.round(Math.min(120, secs) * 48000) * 4;
+}
+
+const mp3Demand: { history: PcmHistory; idleSinceMs: number } | null = config.mp3OnDemand
+  ? { history: new PcmHistory(mp3HistoryBytes()), idleSinceMs: 0 }
+  : null;
+
+function mp3GoIdle() {
+  if (!mp3Demand || state.mp3EncoderMode === "idle") return;
+  state.mp3EncoderMode = "idle";
+  mp3Demand.idleSinceMs = 0;
+  preBuffer.reset(); // lo que hay es audio viejo; el próximo oyente recibe el historial recodificado
+  rtmpLog.event("debug", Event.encoderMasterStopped, `MP3 bajo demanda: sin oyentes /mp3 hace ${MP3_IDLE_GRACE_MS / 1000}s; LAME en reposo`);
+}
+
+/** Lo llama el servidor HTTP al registrar un oyente /mp3. */
+export function mp3ListenerJoined(): void {
+  if (!mp3Demand || !nativeEncoder || state.mp3EncoderMode !== "idle") {
+    if (mp3Demand) mp3Demand.idleSinceMs = 0;
+    return;
+  }
+  state.mp3EncoderMode = "warming";
+  state.mp3EncoderWakeups++;
+  const gen = ++mp3WarmGeneration;
+  // Encoder nuevo: su estado interno (reservorio de bits, solape MDCT) era de hace minutos
+  try { nativeEncoder.encoder.close(); } catch { /* noop */ }
+  try {
+    nativeEncoder.encoder = new LameEncoder(48000, 2, config.fallbackBitrateKbps, 2);
+  } catch (err) {
+    rtmpLog.fail(ErrorCode.encode, "MP3 bajo demanda: no se pudo recrear LAME", { error: (err as Error).message });
+    state.mp3EncoderMode = "live";
+    return;
+  }
+  const h = mp3Demand.history;
+  // En directo low-latency no se manda prebuffer (igual que el snapshot del servidor HTTP)
+  let cursor = config.lowLatency && state.isBroadcasting ? h.total : h.oldest;
+  const t0 = performance.now();
+  rtmpLog.event("debug", Event.encoderMasterStarted, `MP3 bajo demanda: oyente /mp3; codificando ${((h.total - cursor) / 192000).toFixed(1)}s de historial`);
+  const step = () => {
+    if (gen !== mp3WarmGeneration || state.mp3EncoderMode !== "warming" || !nativeEncoder) return;
+    const end = h.total;
+    if (cursor < h.oldest) cursor = h.oldest; // (no debería pasar: se codifica a ~30×)
+    if (cursor >= end) {
+      state.mp3EncoderMode = "live";
+      rtmpLog.event("debug", Event.encoderMasterStarted, `MP3 bajo demanda: en vivo (historial en ${Math.round(performance.now() - t0)}ms)`);
+      return;
+    }
+    const n = Math.min(MP3_WARM_SLICE_BYTES, end - cursor);
+    encodeMp3(h.read(cursor, n));
+    cursor += n;
+    setTimeout(step, 0); // ceder el event loop entre rodajas (~9 ms de CPU cada una)
+  };
+  step();
+}
+
 function writeToMaster(chunk: Uint8Array) {
   if (chunk.byteLength === 0) return;
 
@@ -384,7 +515,39 @@ function writeToMaster(chunk: Uint8Array) {
   state.audioClockSamples += frames;
   state.audioSamplesProduced += frames;
 
-  // Opus tier - escribe el mismo PCM crudo al encoder opus si está habilitado
+  if (!encBatch) {
+    feedEncoders(chunk);
+    return;
+  }
+  // Lote contiguo pre-asignado (sin asignaciones): se entrega a los encoders cada
+  // ENCODER_BATCH_MS. LAME y libopus producen los mismos bytes con cualquier troceado
+  // del PCM (verificado), así que solo cambian las llamadas: ~38/s → 10/s por encoder.
+  let off = 0;
+  while (off < chunk.byteLength) {
+    const n = Math.min(ENC_BATCH_BYTES - encBatchFill, chunk.byteLength - off);
+    encBatch.set(n === chunk.byteLength ? chunk : chunk.subarray(off, off + n), encBatchFill);
+    encBatchFill += n;
+    off += n;
+    if (encBatchFill === ENC_BATCH_BYTES) {
+      feedEncoders(encBatch);
+      encBatchFill = 0;
+    }
+  }
+}
+
+/** Entrega al encoder lo que quede en el lote (al parar el encoder). */
+export function flushEncoderBatch(): void {
+  if (encBatch && encBatchFill > 0) {
+    const pending = encBatch.subarray(0, encBatchFill);
+    encBatchFill = 0;
+    feedEncoders(pending);
+  }
+}
+
+function feedEncoders(chunk: Uint8Array) {
+  // Opus tier - escribe el mismo PCM crudo al encoder opus si está habilitado.
+  // FileSink.write escribe al pipe en el acto o copia lo pendiente a su buffer
+  // interno, así que el lote se puede reutilizar al volver (igual que el pool PCM).
   if (config.opusTierEnabled && state.opusProcess?.stdin) {
     try {
       state.opusProcess.stdin.write(chunk);
@@ -396,21 +559,23 @@ function writeToMaster(chunk: Uint8Array) {
 
   if (nativeEncoder) {
     // --- Modo nativo: LAME FFI (sin DSP) ---
-    const frameBytes = 4; // stereo s16le = 4 bytes por frame
-    const alignedLen = Math.floor(chunk.byteLength / frameBytes) * frameBytes;
+    const alignedLen = chunk.byteLength & ~3; // stereo s16le = 4 bytes por frame
     if (alignedLen === 0) return;
-
-    const pcm = new Int16Array(
-      chunk.buffer,
-      chunk.byteOffset,
-      alignedLen / 2,
-    );
-
-    const mp3 = nativeEncoder.encoder.encode(pcm);
-    if (mp3.length > 0) {
-      bitrateDetector.feed(mp3);
-      broadcast(mp3);
+    if (mp3Demand) {
+      mp3Demand.history.write(chunk.subarray(0, alignedLen));
+      if (state.mp3EncoderMode !== "live") return; // nadie escucha /mp3: no se codifica
+      if (state.mp3Clients.size === 0) {
+        const now = Date.now();
+        if (mp3Demand.idleSinceMs === 0) mp3Demand.idleSinceMs = now;
+        else if (now - mp3Demand.idleSinceMs >= MP3_IDLE_GRACE_MS) {
+          mp3GoIdle();
+          return;
+        }
+      } else {
+        mp3Demand.idleSinceMs = 0;
+      }
     }
+    encodeMp3(chunk.subarray(0, alignedLen));
   } else if (state.masterProcess?.stdin) {
     // --- Modo ffmpeg (fallback) ---
     try {
@@ -1174,6 +1339,12 @@ export function stopOpusEncoder() {
 }
 
 export function stopMasterEncoder() {
+  // Lo que quede en el lote de PCM llega a los encoders antes de cerrarlos
+  flushEncoderBatch();
+  state.mp3EncoderMode = "live";
+  mp3WarmGeneration++;
+  if (mp3Demand) mp3Demand.idleSinceMs = 0;
+
   // Opus tier
   stopOpusEncoder();
 
@@ -1368,11 +1539,38 @@ export function startFallback() {
     "-"
   ];
 
+  // --- Decode en proceso (USE_NATIVE_DECODE): libavcodec vía FFI, sin proceso ---
+  // Mismo PCM que `ffmpeg -i X -f s16le -ar 48000 -ac 2` (verificado byte a byte) y
+  // mismo pacing que `-re` (ráfaga de 0,5 s + 1×). Ahorra un proceso, un pipe y una
+  // copia por pista (~1,9 % de núcleo y ~40 MB de RSS medidos). Se queda en ffmpeg
+  // lo que el decoder nativo no replica: ganancia/salto del análisis, URLs remotas
+  // (abrirlas bloquearía el event loop) y DECK_FFLAGS_NOBUFFER.
+  const needsFfmpeg = (plan !== null && (plan.gainDb !== 0 || plan.leadSkipSec > 0))
+    || config.deckFflagsNobuffer
+    || /^[a-z][a-z0-9+.-]*:\/\//i.test(fileToPlay);
+  if (config.useNativeDecode !== "false" && !needsFfmpeg && isNativeDecodeAvailable()) {
+    try {
+      const decoder = new NativeDecoder(fileToPlay);
+      currentDeck.process = decoder;
+      state.deckDecodesNative++;
+      if (!nativeDecodeAnnounced) {
+        nativeDecodeAnnounced = true;
+        rtmpLog.ok(Event.nativeDecodeLoaded, "Decks con decode nativo (libavcodec FFI): sin proceso ffmpeg por pista", { file: fileToPlay });
+      }
+      const reader = decoder.stdout.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+      pipeFallback(currentDeck, reader, session);
+      return;
+    } catch (err) {
+      rtmpLog.event("warn", Event.nativeFallback, `Decode nativo falló para "${cleanName}"; se usa ffmpeg`, { file: fileToPlay, error: (err as Error).message });
+    }
+  }
+
   try {
     currentDeck.process = Bun.spawn(["ffmpeg", ...args], {
       stdout: "pipe",
       stderr: "pipe",
     });
+    state.deckDecodesFfmpeg++;
     drainProcessStderr(currentDeck.process, `Deck-${currentDeck.id}`);
 
     const reader = currentDeck.process.stdout.getReader();
@@ -1814,6 +2012,48 @@ export async function runRtmpListener() {
 // =============================================================
 // 6. BUCLE SRT (reemplazo RTMP sin plan B - UDP, 0-RTT, sin HOL)
 // =============================================================
+
+// SRT_ON_DEMAND — un `ffmpeg -i srt://…?mode=listener` en reposo no es gratis:
+// libsrt despierta su hilo RcvQ ~450 veces/s (recvmsg con timeout) y ffmpeg
+// ~100 futex/s: 1,5-1,7 % de un núcleo y ~36 MB de RSS sin nadie emitiendo
+// (14 h de CPU en 35 días en producción). En su lugar, un socket UDP de Bun
+// (epoll, 0 despertares) espera el primer datagrama del emisor; se cierra y se
+// lanza el listener, que contesta al siguiente reintento del handshake (el
+// emisor SRT lo repite cada ~250 ms durante su connect timeout de 3 s).
+const SRT_WAKE_TIMEOUT_MS = 15_000;
+
+/** true si un paquete despertó el puerto; false si no se pudo armar (→ listener permanente). */
+export async function waitForSrtKnock(): Promise<boolean> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let sock: { close(): void } | null = null;
+    try {
+      let knocked!: () => void;
+      const knock = new Promise<void>((resolve) => { knocked = resolve; });
+      sock = await Bun.udpSocket({
+        hostname: config.host,
+        port: config.srtPort,
+        socket: { data() { knocked(); } },
+      });
+      state.srtArmed = true;
+      rtmpLog.ok(Event.sourceListening, `SRT bajo demanda en el puerto ${config.srtPort} (sin ffmpeg hasta que llegue el emisor)`, { port: config.srtPort, host: config.host, protocol: "srt", onDemand: true });
+      await knock;
+      state.srtWakeups++;
+      rtmpLog.event("debug", Event.sourceListening, "SRT bajo demanda: paquete recibido; lanzando listener");
+      return true;
+    } catch (err) {
+      // El ffmpeg anterior puede tardar unos ms en soltar el puerto
+      if (attempt === 9) {
+        rtmpLog.event("warn", Event.sourceListening, "SRT bajo demanda: no se pudo armar el socket UDP; listener ffmpeg permanente", { error: (err as Error).message });
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    } finally {
+      state.srtArmed = false;
+      try { sock?.close(); } catch { /* noop */ }
+    }
+  }
+  return false;
+}
 export async function runSrtListener() {
   startMasterEncoder();
   const srtResidueAccumulator = new PcmResidueAccumulator();
@@ -1823,6 +2063,7 @@ export async function runSrtListener() {
   const flapCooldownMs = config.lowLatency ? 5000 : 60000;
   let disconnectTimestamps: number[] = [];
   let srtCooldownUntil = 0;
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
 
   while (true) {
     if (state.shuttingDown) break;
@@ -1833,8 +2074,16 @@ export async function runSrtListener() {
       continue;
     }
 
+    // SRT_ON_DEMAND: sin ffmpeg escuchando en reposo; un socket UDP de Bun espera el
+    // primer paquete del emisor y entonces se lanza el listener (ver waitForSrtKnock).
+    let wokenOnDemand = false;
+    if (config.srtOnDemand) {
+      wokenOnDemand = await waitForSrtKnock();
+      if (state.shuttingDown) break;
+    }
+
     // SRT ready is debug only (TUI shows status via side panel, not log spam)
-    rtmpLog.ok(Event.sourceListening, `Escuchando SRT en el puerto ${config.srtPort}`, { port: config.srtPort, host: config.host, protocol: "srt" });
+    if (!wokenOnDemand) rtmpLog.ok(Event.sourceListening, `Escuchando SRT en el puerto ${config.srtPort}`, { port: config.srtPort, host: config.host, protocol: "srt" });
 
     const args = [
       "-loglevel", "warning",
@@ -1867,6 +2116,15 @@ export async function runSrtListener() {
       rtmpLog.event("debug", Event.sourceListening, "SRT receptor activo, esperando audio");
 
       let firstAudioAt = 0;
+      // Despertado por un paquete suelto (escáner, sonda) que no llega a emitir: re-armar
+      if (wokenOnDemand) {
+        wakeTimer = setTimeout(() => {
+          if (firstAudioAt === 0 && state.sourceProcess === proc) {
+            rtmpLog.event("debug", Event.sourceStopped, `SRT bajo demanda: sin audio en ${SRT_WAKE_TIMEOUT_MS / 1000}s; vuelve a reposo`);
+            try { proc.kill(); } catch { /* noop */ }
+          }
+        }, SRT_WAKE_TIMEOUT_MS);
+      }
       while (true) {
         const { done, value: rawValue } = await reader.read();
         if (done) break;
@@ -1918,6 +2176,7 @@ export async function runSrtListener() {
       rtmpLog.fail(missingBinaryCode(err) ?? ErrorCode.source, "Error en la fuente SRT", { error: (err as Error).message });
       await new Promise((r) => setTimeout(r, 2000));
     } finally {
+      if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
       const wasBroadcasting = state.isBroadcasting;
       rtmpLog.ok(Event.sourceDisconnected, "Fuente SRT desconectada; limpiando", { source: "srt" });
       state.isBroadcasting = false;

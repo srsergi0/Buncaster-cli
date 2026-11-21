@@ -76,7 +76,7 @@ export interface BootReport {
     maxListeners: number;
     preBufferBytes: number;
   };
-  native: { useNativeLame: string; useNativeDecode: string };
+  native: { useNativeLame: string; useNativeDecode: string; encoderBatchMs: number; mp3OnDemand: boolean; srtOnDemand: boolean };
   security: { adminUser: string; adminPasswordSet: boolean; streamKey: string | null; corsOrigin: string };
   fallback: { source: string; exists: boolean; isDir: boolean; audioFiles: number };
   dependencies: {
@@ -123,6 +123,9 @@ export function buildBootReport(): BootReport {
     native: {
       useNativeLame: config.useNativeLame,
       useNativeDecode: config.useNativeDecode,
+      encoderBatchMs: config.encoderBatchMs,
+      mp3OnDemand: config.mp3OnDemand,
+      srtOnDemand: config.srtOnDemand,
     },
     security: {
       adminUser: config.adminUser,

@@ -30,7 +30,16 @@ Radio por internet: ingesta RTMP (OBS) + transcodificación nativa (LAME-FFI + d
 | `FALLBACK_STALL_SECONDS` | `5` | Salta de pista si el encoder lleva N s sin PCM fuera de directo (deck colgado). `0` = off. |
 | `ENCODER_SUPERVISION` | `true` | Reinicio con backoff del encoder opus si muere o se cuelga (10 s sin páginas). |
 
-Notas verificadas (nov-2026): las rutas de stream servidas son solo `/mp3` y `/opus` (el publisher usa `OPUS_UPSTREAM_URL=http://buncaster:4321/opus`); los decks de fallback **sí** son procesos `ffmpeg -re` (`USE_NATIVE_DECODE` no tiene efecto: `NativeDecoder` no se usa); `/health` pasa a `degraded` si hay >2 s de aire muerto.
+### Eficiencia "Bun way" (ver `docs/ENGINE-BUN-WAY.md`)
+
+| Variable | Default | Qué hace |
+|---|---|---|
+| `ENCODER_BATCH_MS` | `100` | PCM a LAME/ffmpeg-opus en bloques de 100 ms. Mismos bytes de salida (verificado); ~4× menos syscalls y envíos por oyente mp3. `0` = antes. |
+| `USE_NATIVE_DECODE` | `auto` | Decks decodificados en proceso (libavcodec FFI): sin `ffmpeg -re` por canción. Solo libavformat 60 + Bun ≥ 1.3. `false` = ffmpeg CLI. |
+| `MP3_ON_DEMAND` | `false` | Sin oyentes `/mp3` 30 s → LAME en reposo (en Bloom el mp3 tiene 0 bytes servidos en 35 días). Recomendado `true` en Bloom. |
+| `SRT_ON_DEMAND` | `false` | Sin ffmpeg SRT en reposo; un socket UDP de Bun lo lanza al primer paquete (+0,3 s para entrar en directo). Recomendado `true` en Bloom. |
+
+Notas verificadas (nov-2026): las rutas de stream servidas son solo `/mp3` y `/opus` (el publisher usa `OPUS_UPSTREAM_URL=http://buncaster:4321/opus`); desde ENGINE-BUN-WAY los decks **sí** usan `NativeDecoder` con `USE_NATIVE_DECODE=auto` (comprobar `radio_deck_decodes_total{engine="native"}` en `/metrics`; antes, desde `e44120e`, eran siempre procesos `ffmpeg -re`); `/health` pasa a `degraded` si hay >2 s de aire muerto. No hay endpoint SSE: `src/events.ts` es solo el catálogo de nombres de evento del log.
 
 ## Despliegue en producción
 ## Despliegue en producción
@@ -57,8 +66,9 @@ El `.env` de bloom debe contener (clave para el arranque rápido y el decode nat
 ## Verificación
 
 - `curl -s http://localhost:4321/health` → `{"status":"ok",...}`
-- RSS saludable ~90-110MB; 0 procesos ffmpeg de decks (solo la fuente RTMP en live)
-- Logs de arranque: `[NativeDecoder] libavformat 60 cargada` + `[Master Encoder] Modo nativo activo`
+- RSS saludable ~90-110MB; 0 procesos ffmpeg de decks (solo el encoder opus y, en live, la fuente SRT)
+- Logs de arranque: `(native.decode.loaded) libavformat 60 cargada` + `(native.decode.loaded) Decks con decode nativo` + `Encoder master nativo LAME-FFI`
+- `/metrics`: `radio_deck_decodes_total{engine="native"}` crece y `{engine="ffmpeg"}` se queda en 0
 
 ## Workflow de release
 

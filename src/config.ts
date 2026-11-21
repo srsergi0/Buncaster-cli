@@ -53,6 +53,16 @@ export interface Config {
   analysisPrescan: boolean;
   /** Archivo de caché del análisis de pistas (sonoridad + silencios). */
   analysisCacheFile: string;
+  // --- Bun way (docs/ENGINE-BUN-WAY.md) ---
+  /**
+   * Agrupa el PCM hacia los encoders (LAME y ffmpeg-opus) en bloques de N ms.
+   * Mismos bytes de salida (verificado), ~4× menos syscalls/FFI y envíos por oyente. 0 = por chunk.
+   */
+  encoderBatchMs: number;
+  /** No codifica MP3 si no hay oyentes /mp3 (30 s de gracia); al llegar uno, codifica el historial PCM. */
+  mp3OnDemand: boolean;
+  /** No mantiene un ffmpeg SRT escuchando: un socket UDP de Bun lo lanza al primer paquete. */
+  srtOnDemand: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -172,6 +182,9 @@ function loadConfig(): Config {
     silenceThresholdDb: envSignedFloat("SILENCE_THRESHOLD_DB", -50),
     analysisPrescan: envBool("ANALYSIS_PRESCAN", true),
     analysisCacheFile: process.env.ANALYSIS_CACHE_FILE || ".analysis-cache.json",
+    encoderBatchMs: Math.min(500, envInt("ENCODER_BATCH_MS", 100)),
+    mp3OnDemand: envBool("MP3_ON_DEMAND", false),
+    srtOnDemand: envBool("SRT_ON_DEMAND", false),
   };
 
   return cfg;

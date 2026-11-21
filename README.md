@@ -98,6 +98,17 @@ Measured rationale for every flag: [docs/ENGINE-ROUNDTABLE.md](docs/ENGINE-ROUND
 | `FALLBACK_STALL_SECONDS` | `5` | Skip to the next track if no PCM reached the encoder for N s while not live (hung deck). `0` disables. |
 | `ENCODER_SUPERVISION` | `true` | Restart the Opus encoder with exponential backoff (1 s → 30 s) if it dies or stops emitting pages for 10 s. |
 
+### ⚙️ Eficiencia "Bun way" (medido en [docs/ENGINE-BUN-WAY.md](docs/ENGINE-BUN-WAY.md))
+
+| Variable | Default | Efecto |
+|----------|---------|--------|
+| `ENCODER_BATCH_MS` | `100` | Agrupa el PCM hacia LAME y ffmpeg-opus en bloques de N ms (máx. 500). **Mismos bytes de salida** (verificado: MP3 sha256 idéntico, paquetes Opus idénticos con cualquier troceado); ~4× menos syscalls y envíos por oyente `/mp3`. Añade ≤ N ms de latencia. `0` = comportamiento anterior (un write por trozo del deck). |
+| `USE_NATIVE_DECODE` | `auto` | Ahora **sí** decodifica los decks en proceso (libavcodec vía FFI; el cableado se perdió en `e44120e`). PCM byte a byte igual que `ffmpeg … -f s16le -ar 48000 -ac 2` y mismo ritmo que `-re`. Quita un proceso ffmpeg por canción. Solo con libavformat 60 (ffmpeg 6.x, offsets verificados) y Bun ≥ 1.3; ganancia/salto del análisis, URLs remotas y `DECK_FFLAGS_NOBUFFER=true` siguen en ffmpeg. `false` = ffmpeg CLI siempre. |
+| `MP3_ON_DEMAND` | `false` | Sin oyentes `/mp3` durante 30 s deja de codificar MP3 (LAME 320k ≈ 3,3 % de un núcleo 24/7). Guarda un historial PCM del tamaño del prebuffer mp3 y, cuando llega un oyente, lo codifica a ~30× tiempo real: recibe la misma ráfaga de prebuffer que hoy. Coste: ~1,3 s de CPU repartidos al despertar en frío (con `PREBUFFER_BYTES=1572864`) y ~7,5 MB de RAM para el historial. |
+| `SRT_ON_DEMAND` | `false` | No mantiene un `ffmpeg` SRT escuchando en reposo (≈ 1,5 % de un núcleo y 36 MB sin nadie emitiendo): un socket UDP de Bun espera el primer paquete y entonces lanza el listener. El emisor tarda ~0,3 s más en entrar en directo (un reintento de handshake). Un paquete suelto sin audio en 15 s vuelve a reposo. |
+
+Métricas nuevas: `radio_deck_decodes_total{engine}`, `radio_mp3_encoder_active`, `radio_mp3_encoder_wakeups_total`, `radio_srt_armed`, `radio_srt_wakeups_total`; bloque `engine.bunWay` en `/status`.
+
 New observability: `/status` and `/health` include an `engine` block (current track loudness/gain, prebuffer seconds per tier, join backlog, dead air, crossfade results, encoder restarts). `/metrics` adds `radio_dead_air_seconds_total`, `radio_digital_silence_seconds_total`, `radio_fallback_stall_restarts_total`, `radio_opus_encoder_restarts_total`, `radio_crossfades_total{result}`, `radio_prebuffer_seconds{tier}`, `radio_listener_join_backlog_seconds_*`, `radio_audio_clock_drift_seconds`.
 
 ---
@@ -202,6 +213,7 @@ Included MCP tools: `get_status`, `get_queue`, `push_to_queue`, `remove_from_que
 ## 📚 Technical Documentation
 
 Explore in-depth architectural audits and performance reports in the [`docs/`](docs/) directory:
+- [docs/ENGINE-BUN-WAY.md](docs/ENGINE-BUN-WAY.md): modelo de costes medido (CPU, memoria, copias, syscalls) y las optimizaciones con su antes/después.
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): Memory profiles, Audio Ring Buffer, and benchmarks.
 - [docs/SRC2.md](docs/SRC2.md) & [docs/IMPLEMENTACION.md](docs/IMPLEMENTACION.md): Architectural audit, FFI memory bounds, and state machines.
 - [docs/RELAY-EXPLAINER.md](docs/RELAY-EXPLAINER.md): Mass-scale fan-out architecture via relays and edge CDNs.

@@ -17,8 +17,9 @@ import { Event, ErrorCode } from "./events";
 //   AVCodecParameters: format=28  channel_layout=104  channels=112  sample_rate=116
 //   AVFrame: data=0  linesize=64  nb_samples=112  format=116
 //   AVPacket.stream_index=36
-// Para otras versiones se derivan: avcodec = avformat, avutil = -2, swresample = -56
-// (mapping válido para ffmpeg 4.x-7.x). Si nada carga, se usa ffmpeg CLI.
+// Solo se carga libavformat 60 (VERIFIED_MAJORS): con otra versión estos offsets
+// leerían campos equivocados. Majors relacionados: avcodec = avformat, avutil = -2,
+// swresample = -56. Si nada carga (o Bun < 1.3), los decks usan ffmpeg CLI.
 
 const AVFORMAT_STREAMS = 48;
 const AVFORMAT_NB_STREAMS = 44;
@@ -39,6 +40,8 @@ const AV_SAMPLE_FMT_S16 = 1;
 const AV_CH_LAYOUT_STEREO = 0x3;
 const AV_CH_LAYOUT_MONO = 0x4;
 const AVERROR_EAGAIN = -11;
+const AVERROR_EOF = -541478725; // FFERRTAG('E','O','F',' ')
+const MAX_CONSECUTIVE_DECODE_ERRORS = 100;
 
 // Salida: 48000 Hz × 2ch × 2 bytes = 192 KB/s
 const PCM_BYTES_PER_SECOND = 192_000;
@@ -63,8 +66,9 @@ interface Symbols {
   av_frame_alloc: () => number;
   av_frame_unref: (frame: number) => void;
   av_frame_free: (frameOut: number) => void;
+  av_log_set_level: (level: number) => void;
   swr_alloc_set_opts: (s: number | null, outLayout: number, outFmt: number, outRate: number, inLayout: number, inFmt: number, inRate: number, logOff: number, logCtx: number | null) => number;
-  swr_convert: (s: number, out: number, outCount: number, input: number, inCount: number) => number;
+  swr_convert: (s: number, out: number, outCount: number, input: number | null, inCount: number) => number;
   swr_init: (s: number) => number;
   swr_free: (sOut: number) => void;
 }
@@ -120,8 +124,13 @@ function readI64(p: number, off: number): number {
   return Number(new DataView(scratch.buffer).getBigInt64(0, true));
 }
 
+// Los offsets de arriba solo se verificaron contra libavformat 60 (ffmpeg 6.x).
+// Con otra versión mayor se leerían campos equivocados (crash o basura), así
+// que solo se carga la 60; cualquier otra → decks con ffmpeg CLI.
+const VERIFIED_MAJORS = ["60"];
+
 function loadLibs(): Symbols | null {
-  const majors = ["60", "61", "59", "58"];
+  const majors = VERIFIED_MAJORS;
   const baseDirs = ["/usr/lib", "/usr/lib/x86_64-linux-gnu"];
   for (const major of majors) {
     const avcodec = major;
@@ -159,6 +168,7 @@ function loadLibs(): Symbols | null {
           av_frame_alloc: { args: [] as const, returns: "ptr" as const },
           av_frame_unref: { args: ["ptr"] as const, returns: "void" as const },
           av_frame_free: { args: ["ptr"] as const, returns: "void" as const },
+          av_log_set_level: { args: ["i32"] as const, returns: "void" as const },
         };
         const defSwr = {
           swr_alloc_set_opts: { args: ["ptr", "i64", "i32", "i32", "i64", "i32", "i32", "i32", "ptr"] as const, returns: "ptr" as const },
@@ -171,6 +181,9 @@ function loadLibs(): Symbols | null {
         const libUtil = dlopen(paths.avutil, defAvutil);
         const libSwr = dlopen(paths.swresample, defSwr);
         const all = { ...libFmt.symbols, ...libCodec.symbols, ...libUtil.symbols, ...libSwr.symbols } as unknown as Symbols;
+        // En proceso, av_log escribiría avisos por frame en el stderr del motor (el ffmpeg
+        // del deck los dejaba en su propio stderr, que solo se muestra si falla). AV_LOG_FATAL.
+        all.av_log_set_level(8);
         rtmpLog.ok(Event.nativeDecodeLoaded, `libavformat ${major} cargada; decks sin ffmpeg`, { version: major, path: paths.avformat });
         return all;
       } catch {
@@ -178,11 +191,29 @@ function loadLibs(): Symbols | null {
       }
     }
   }
-  rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar libavformat; decks con ffmpeg CLI");
+  rtmpLog.event("info", Event.nativeFallback, `libavformat ${VERIFIED_MAJORS.join("/")} no disponible; decks con ffmpeg CLI`);
   return null;
 }
 
+let loadAttempted = false;
+
+/** Carga perezosa: solo se abre libavformat si alguien va a decodificar en proceso. */
 export function isNativeDecodeAvailable(): boolean {
+  if (!loadAttempted) {
+    loadAttempted = true;
+    // Medido (ENGINE-BUN-WAY.md): Bun 1.2 (glibc) revienta dentro de
+    // avformat_find_stream_info vía FFI; 1.2 musl, 1.3 y 1.4 funcionan. Por debajo
+    // de 1.3 no se arriesga el proceso entero: decks con ffmpeg CLI.
+    if (Bun.semver.order(Bun.version, "1.3.0") < 0) {
+      rtmpLog.event("info", Event.nativeFallback, `Bun ${Bun.version} < 1.3: decode nativo desactivado; decks con ffmpeg CLI`);
+      return false;
+    }
+    if (!loadMemcpy()) {
+      rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar memcpy de libc; decks con ffmpeg CLI");
+    } else {
+      symbols = loadLibs();
+    }
+  }
   return symbols !== null;
 }
 
@@ -254,8 +285,14 @@ function openTrack(path: string): TrackState {
     const inFmt = readI32(codecpar, CODEPAR_FORMAT);
     const inRate = readI32(codecpar, CODEPAR_SAMPLE_RATE);
     let inLayout = readI64(codecpar, CODEPAR_CHANNEL_LAYOUT);
+    const inChannels = readI32(codecpar, CODEPAR_CHANNELS);
+    // Cordura: si un offset no corresponde a la lib cargada, estos valores salen
+    // absurdos. Mejor rechazar la pista (→ ffmpeg CLI) que alimentar swr con basura.
+    if (!(inRate >= 1000 && inRate <= 768_000) || !(inFmt >= 0 && inFmt <= 11) || !(inChannels >= 1 && inChannels <= 64)) {
+      throw new Error(`parámetros de audio no plausibles (rate=${inRate} fmt=${inFmt} ch=${inChannels})`);
+    }
     if (!inLayout) {
-      inLayout = readI32(codecpar, CODEPAR_CHANNELS) === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+      inLayout = inChannels === 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
     }
 
     swr = S.swr_alloc_set_opts(null, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 48000, inLayout, inFmt, inRate, 0, null);
@@ -289,12 +326,115 @@ function closeTrack(st: TrackState) {
 }
 
 // =============================================================
-// NATIVE DECODER — misma interfaz que un proceso ffmpeg:
-//   .stdout.getReader() → chunks PCM s16le 48k stereo (1/s, 192KB)
-//   .kill()  .exited
-// El pacing es por reloj (equivalente a -re): emite 1s de audio por
-// segundo de pared, autocorrigiendo el drift.
+// DECODE: llena `out` con PCM s16le 48 kHz estéreo hasta `limit` bytes.
+// Al llegar al EOF del demuxer: paquete nulo → drena el decoder → drena
+// swresample (las muestras retenidas por el filtro de remuestreo). Antes
+// se devolvía en cuanto se enviaba el paquete nulo y se perdía la cola.
 // =============================================================
+interface DrainState { sentFlush: boolean; decoderDone: boolean; done: boolean; errors: number }
+
+function decodeInto(st: TrackState, out: Uint8Array, limit: number, ds: DrainState): number {
+  const S = symbols!;
+  let written = 0;
+  while (written < limit && !ds.done) {
+    if (ds.decoderDone) {
+      // Vaciar el remuestreador: swr_convert con entrada nula
+      const room = Math.floor((out.length - written) / 4);
+      if (room <= 0) break;
+      writePtr(st.swrOutPtr, ptr(out) + written);
+      const n = S.swr_convert(st.swr, ptr(st.swrOutPtr), room, null, 0);
+      if (n <= 0) { ds.done = true; break; }
+      written += n * 4;
+      continue;
+    }
+    const r = S.avcodec_receive_frame(st.avctx, st.frame);
+    if (r === AVERROR_EAGAIN) {
+      if (ds.sentFlush) { ds.decoderDone = true; continue; }
+      const pr = S.av_read_frame(st.fmtCtx, st.pkt);
+      if (pr < 0) {
+        // Fin del archivo: paquete nulo y seguir drenando frames retenidos
+        ds.sentFlush = true;
+        S.avcodec_send_packet(st.avctx, null);
+        continue;
+      }
+      if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) {
+        S.av_packet_unref(st.pkt);
+        continue;
+      }
+      const sr = S.avcodec_send_packet(st.avctx, st.pkt);
+      // avcodec_send_packet NO libera el paquete: sin av_packet_unref,
+      // cada paquete (~192KB/s de audio comprimido) se fuga para siempre
+      // (~11MB/min de RSS). Mismo criterio con av_frame_unref tras swr.
+      S.av_packet_unref(st.pkt);
+      if (sr < 0 && sr !== AVERROR_EAGAIN) {
+        // Paquete corrupto: ffmpeg CLI lo descarta y sigue; aquí igual
+        continue;
+      }
+      continue;
+    }
+    if (r === AVERROR_EOF) { ds.decoderDone = true; continue; } // decoder vacío tras el flush
+    if (r < 0) {
+      // Error de decodificación de un frame: ffmpeg CLI lo registra y sigue
+      if (++ds.errors > MAX_CONSECUTIVE_DECODE_ERRORS) ds.decoderDone = true;
+      continue;
+    }
+    ds.errors = 0;
+
+    const nbSamples = readI32(st.frame, AVFRAME_NB_SAMPLES);
+    if (nbSamples <= 0) { S.av_frame_unref(st.frame); continue; }
+    const room = Math.floor((out.length - written) / 4);
+    writePtr(st.swrOutPtr, ptr(out) + written);
+    // `room` incluye margen para el frame más grande; si no cabe todo, swr retiene
+    // el resto internamente y sale en la siguiente llamada (no se pierde).
+    const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), room, st.frame, nbSamples);
+    S.av_frame_unref(st.frame); // liberar el búfer del frame decodificado
+    if (outCount > 0) written += outCount * 4;
+  }
+  return written;
+}
+
+/**
+ * Decodifica un archivo entero en proceso, sin pacing (tests, verificación de
+ * PCM contra ffmpeg CLI y, en el futuro, análisis de pista sin spawn).
+ */
+export function decodeFileToPcm(path: string, maxBytes = Number.MAX_SAFE_INTEGER): Uint8Array {
+  if (!isNativeDecodeAvailable()) throw new Error("decode nativo no disponible");
+  const st = openTrack(path);
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  const ds: DrainState = { sentFlush: false, decoderDone: false, done: false, errors: 0 };
+  try {
+    while (!ds.done && total < maxBytes) {
+      const block = new Uint8Array(ACCUM_CAPACITY);
+      const n = decodeInto(st, block, PCM_BYTES_PER_SECOND, ds);
+      if (n > 0) { parts.push(block.subarray(0, n)); total += n; }
+    }
+  } finally {
+    closeTrack(st);
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  return out;
+}
+
+// =============================================================
+// NATIVE DECODER — misma interfaz que un proceso ffmpeg:
+//   .stdout.getReader() → chunks PCM s16le 48k estéreo  .kill()  .exited
+// Pacing equivalente a `ffmpeg -re` (ffmpeg 6.1: readrate 1 con
+// readrate_initial_burst 0.5 s): ráfaga inicial de 0.5 s y luego 1× por
+// reloj de pared, autocorregido. Esa ráfaga es la que llena el buffer del
+// deck entrante antes del crossfade; sin ella habría huecos al cruzar.
+//
+// Memoria (mimalloc / Drepper): swr escribe en un scratch reutilizado; cada
+// ~1 s se copia a un bloque del tamaño exacto (1 asignación/s) y se encolan
+// VISTAS de 4 KiB (≈21 ms) de ese bloque, sin más copias. Los consumidores
+// (buffer del deck, historial) guardan referencias: un bloque nunca se reutiliza.
+// =============================================================
+const CHUNK_BYTES = 4096; // 1024 frames ≈ 21,3 ms: granularidad del crossfade (ffmpeg: 26-93 ms)
+const INITIAL_BURST_BYTES = 96_000; // 0,5 s
+const TICK_MAX_MS = 50;
+
 export class NativeDecoder {
   readonly exited: Promise<number>;
   stdout!: ReadableStream<Uint8Array>;
@@ -307,116 +447,68 @@ export class NativeDecoder {
       this.stdout = new ReadableStream<Uint8Array>({
         start: (controller) => {
           this.run(st, controller)
-            .then(() => resolve(0))
+            .then(() => resolve(this.cancelled ? 143 : 0))
             .catch((err) => {
               rtmpLog.fail(ErrorCode.decode, "Error en bucle de decode nativo", { error: err instanceof Error ? err.message : String(err) });
               try { controller.error(err); } catch { /* noop */ }
               resolve(1);
             });
         },
+        cancel: () => { this.cancelled = true; },
       });
     });
   }
 
-  kill() {
+  /** Igual que Subprocess.kill(): la señal se ignora, el bucle para en el siguiente tick. */
+  kill(_signal?: number | string) {
     this.cancelled = true;
   }
 
-  // Acumula frames decodificados en `out` hasta 1s (192KB) o EOF.
-  // Devuelve el total acumulado; 0 = EOF sin datos nuevos.
-  private fill(st: TrackState, out: Uint8Array, flushedState: { flushed: boolean }): number {
-    const S = symbols!;
-    let written = 0;
-    while (written < PCM_BYTES_PER_SECOND) {
-      const r = S.avcodec_receive_frame(st.avctx, st.frame);
-      if (r === AVERROR_EAGAIN) {
-        const pr = S.av_read_frame(st.fmtCtx, st.pkt);
-        if (pr < 0) {
-          // Fin del archivo: flush del decoder (packet nulo)
-          if (!flushedState.flushed) {
-            flushedState.flushed = true;
-            S.avcodec_send_packet(st.avctx, null);
-          }
-          return written;
-        }
-        if (readI32(st.pkt, AVPACKET_STREAM_INDEX) !== st.streamIdx) {
-          S.av_packet_unref(st.pkt);
-          continue;
-        }
-        const sr = S.avcodec_send_packet(st.avctx, st.pkt);
-        // avcodec_send_packet NO libera el paquete: sin av_packet_unref,
-        // cada paquete (~192KB/s de audio comprimido) se fuga para siempre
-        // (~11MB/min de RSS). Mismo criterio con av_frame_unref tras swr.
-        S.av_packet_unref(st.pkt);
-        if (sr < 0 && sr !== AVERROR_EAGAIN) return written;
-        continue; // volver a recibir (si send fue EAGAIN, el receive drena la cola)
-      }
-      if (r < 0) return written; // EOF del decoder
-
-      const nbSamples = readI32(st.frame, AVFRAME_NB_SAMPLES);
-      if (nbSamples <= 0) continue;
-
-      const remainingBytes = out.length - written;
-      const maxOutSamples = Math.floor(remainingBytes / 4);
-      if (maxOutSamples <= 0) {
-        S.av_frame_unref(st.frame);
-        break;
-      }
-
-      writePtr(st.swrOutPtr, ptr(out) + written);
-      const outCount = S.swr_convert(st.swr, ptr(st.swrOutPtr), maxOutSamples, st.frame, nbSamples);
-      S.av_frame_unref(st.frame); // liberar el búfer del frame decodificado
-      if (outCount <= 0) continue;
-      written += outCount * 4;
-      if (written >= out.length) break; // margen lleno
-    }
-    return written;
-  }
-
   private async run(st: TrackState, controller: ReadableStreamDefaultController<Uint8Array>) {
-    const out = new Uint8Array(ACCUM_CAPACITY);
-    const flushedState = { flushed: false };
-    let emittedBytes = 0;
+    const ds: DrainState = { sentFlush: false, decoderDone: false, done: false, errors: 0 };
+    const scratch = new Uint8Array(ACCUM_CAPACITY); // destino de swr, reutilizado
+    let block = new Uint8Array(0);
+    let blockOff = 0;
+    let blockLen = 0;
+    let emitted = 0;
     const t0 = performance.now();
 
     try {
       while (!this.cancelled) {
-        // Pacing real-time (equivalente a -re): 192 B/ms, en slices de 50ms
-        const targetMs = emittedBytes / 192;
-        while (true) {
-          const wait = targetMs - (performance.now() - t0);
-          if (wait <= 0 || this.cancelled) break;
-          await Bun.sleep(Math.min(50, wait));
-        }
-        if (this.cancelled) break;
         if (controller.desiredSize !== null && controller.desiredSize < -PCM_BYTES_PER_SECOND) {
           await Bun.sleep(100); // consumidor lento: backoff simple
           continue;
         }
-
-        const n = this.fill(st, out, flushedState);
-        if (n <= 0) break; // EOF sin datos pendientes
-
-        const chunk = out.slice(0, n);
-        try {
-          controller.enqueue(chunk);
-        } catch {
-          break; // stream cancelado
+        const allowed = INITIAL_BURST_BYTES + (performance.now() - t0) * 192;
+        let ended = false;
+        while (emitted + CHUNK_BYTES <= allowed) {
+          if (blockOff >= blockLen) {
+            if (ds.done) { ended = true; break; }
+            const n = decodeInto(st, scratch, PCM_BYTES_PER_SECOND, ds);
+            if (n === 0) { ended = true; break; }
+            // Copia al tamaño exacto: el scratch lleva ~98 KB de margen para el frame
+            // más grande; reservar el bloque con margen asignaba un 50 % de más (medido).
+            block = scratch.slice(0, n);
+            blockLen = n;
+            blockOff = 0;
+          }
+          const n = Math.min(CHUNK_BYTES, blockLen - blockOff);
+          try {
+            controller.enqueue(block.subarray(blockOff, blockOff + n));
+          } catch {
+            ended = true; // stream cancelado
+            break;
+          }
+          blockOff += n;
+          emitted += n;
         }
-        emittedBytes += n;
-        if (n < PCM_BYTES_PER_SECOND) break; // chunk parcial = fin de pista
+        if (ended) break;
+        const dueInMs = (emitted + CHUNK_BYTES - INITIAL_BURST_BYTES) / 192 - (performance.now() - t0);
+        await Bun.sleep(Math.max(1, Math.min(TICK_MAX_MS, dueInMs)));
       }
     } finally {
       try { controller.close(); } catch { /* noop */ }
       closeTrack(st);
     }
   }
-}
-
-symbols = loadLibs();
-
-// memcpy de libc para leer memoria C (toArrayBuffer roto en Bun 1.3)
-if (!loadMemcpy()) {
-  rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar memcpy de libc; decks con ffmpeg CLI");
-  symbols = null;
 }
