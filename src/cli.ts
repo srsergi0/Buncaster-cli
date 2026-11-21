@@ -69,6 +69,8 @@ const args = process.argv.slice(2);
 let flagDashboard: string | null = null;
 let flagOutput: string | null = null;
 let flagSrt: string | null = null;
+let flagLogFormat: string | null = null;
+let flagLogLevel: string | null = null;
 let noPrompt = process.env.NO_PROMPT === "1" || process.env.NO_PROMPT === "true" ||
                process.env.AUTO_START === "1" || process.env.AUTO_START === "true" ||
                process.env.CI === "1" || process.env.CI === "true";
@@ -92,6 +94,12 @@ for (let i = 0; i < args.length; i++) {
   } else if (arg === "--srt-port" || arg === "-s") {
     const val = args[++i];
     if (val && isValidPort(val)) flagSrt = val;
+  } else if (arg === "--log-format") {
+    const val = args[++i];
+    if (val === "json" || val === "text") flagLogFormat = val;
+  } else if (arg === "--log-level") {
+    const val = args[++i];
+    if (val && ["debug", "info", "warn", "error"].includes(val)) flagLogLevel = val;
   } else if (arg === "-h" || arg === "--help") {
     console.log(`
 Uso: bun run dev [opciones] o bun src/cli.ts [opciones]
@@ -102,6 +110,8 @@ Opciones:
   -d, --dashboard-port <p>     Configura el puerto del Dashboard web (default: 8080)
   -o, --output-port <p>        Configura el puerto de streams /mp3 y /opus (default: 8080)
   -s, --srt-port <p>           Configura el puerto de ingesta SRT para OBS (default: 1936)
+      --log-format <fmt>       Formato de logs: text (default) | json
+      --log-level <lvl>        Nivel de logs: debug | info (default) | warn | error
   -h, --help                   Muestra esta ayuda
 
 Variables de entorno:
@@ -109,6 +119,8 @@ Variables de entorno:
   PORT / DASHBOARD_PORT        Puerto web
   OUTPUT_PORT / STREAM_PORT    Puerto de streams
   SRT_PORT                     Puerto de ingesta SRT
+  LOG_FORMAT=json|text         Formato de logs (json = una línea por evento)
+  LOG_LEVEL=debug|info|warn|error
 `);
     process.exit(0);
   }
@@ -158,6 +170,8 @@ process.env.OUTPUT_PORT = outputPort;
 process.env.STREAM_PORT = outputPort;
 process.env.PORT = dashboardPort;
 process.env.SRT_PORT = srtPort;
+if (flagLogFormat) process.env.LOG_FORMAT = flagLogFormat;
+if (flagLogLevel) process.env.LOG_LEVEL = flagLogLevel;
 
 // Also persist to .env if user wants? Not for now, just runtime
 

@@ -1,5 +1,6 @@
 import { dlopen, ptr } from "bun:ffi";
 import { rtmpLog } from "./logger";
+import { Event, ErrorCode } from "./events";
 
 // ======================================================// Wrapper Bun.FFI sobre libmp3lame.so — encoding MP3 sin ffmpeg
 // ======================================================// Llama directamente a la librería C compartida del sistema,
@@ -69,15 +70,13 @@ export function isNativeLameAvailable(): boolean {
         lame_close: { args: ["ptr"], returns: "i32" },
       });
       symbols = lib.symbols as unknown as LameSymbols;
-      rtmpLog.debug(`[LAME-FFI] libmp3lame loaded from ${path}`);
+      rtmpLog.event("debug", Event.nativeLameLoaded, `libmp3lame cargada`, { path });
       return true;
     } catch {
       // intentar siguiente ruta
     }
   }
-  rtmpLog.warn(
-    "[LAME-FFI] Could not load libmp3lame. Using ffmpeg fallback for MP3 encoding.",
-  );
+  rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar libmp3lame; MP3 vía ffmpeg");
   return false;
 }
 
@@ -168,7 +167,7 @@ export class LameEncoder {
     );
 
     if (written < 0) {
-      rtmpLog.error(`[LAME-FFI] encoding error: ${written}`);
+      rtmpLog.fail(ErrorCode.encode, `Error de encoding LAME (${written})`, { written });
       return EMPTY_MP3;
     }
 

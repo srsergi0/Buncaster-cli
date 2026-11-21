@@ -9,22 +9,30 @@ import { config } from "./config";
 import { sysLog, httpLog } from "./logger";
 import { state } from "./state";
 import { startFallback, stopFallback, stopMasterEncoder, stopPlaylistWatcher, runSrtListener, stopSilence } from "./audio-router";
+import { logBootReport, logReady } from "./boot-report";
+import { Event } from "./events";
 import "./http-server"; // Levanta el servidor HTTP automáticamente al importar
 
 // =============================================================
 // 1. INICIALIZACIÓN DE FUENTES
 // =============================================================
 
-// TUI is the only interface now — no console banner (TUI header shows streams)
-if (false) {
-  console.log("");
-}
+// Reporte de arranque: config resuelta + capacidades (para agentes/LLM)
+logBootReport();
 
 // Arrancar audio de respaldo (fallback) inmediatamente
 startFallback();
 
 // Arrancar receptor SRT en segundo plano (sin RTMP, sin plan B)
 runSrtListener();
+
+// Anunciar que el servidor está listo y accesible
+logReady({
+  dashboard: config.dashboardPort,
+  output: config.outputPort,
+  srt: config.srtPort,
+  streamKey: config.rtmpStreamKey,
+});
 
 // =============================================================
 // 2. APAGADO ORDENADO
@@ -33,7 +41,7 @@ runSrtListener();
 function shutdown(signal: string): void {
   if (state.shuttingDown) return;
   state.shuttingDown = true;
-  sysLog.info(`Signal ${signal} received, shutting down server...`);
+  sysLog.ok(Event.serverShutdown, `Señal ${signal} recibida, apagando servidor...`, { signal });
 
   // Detener todos los oyentes de forma limpia
   for (const [, client] of state.clients) {
@@ -60,7 +68,7 @@ function shutdown(signal: string): void {
     }
   }
 
-  sysLog.info("Server closed correctly.");
+  sysLog.ok(Event.serverShutdown, "Servidor cerrado correctamente");
   process.exit(0);
 }
 
@@ -68,9 +76,9 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 process.on("uncaughtException", (err) => {
-  sysLog.error("Uncaught exception:", err);
+  sysLog.fail("E_UNKNOWN", "Excepción no capturada", { error: err instanceof Error ? err.stack : String(err) });
 });
 
 process.on("unhandledRejection", (reason) => {
-  sysLog.error("Unhandled promise rejection:", reason);
+  sysLog.fail("E_UNKNOWN", "Promesa rechazada sin manejar", { reason: reason instanceof Error ? reason.stack : String(reason) });
 });

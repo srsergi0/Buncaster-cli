@@ -78,6 +78,30 @@ http://localhost:8080/stream?format=opus  # Query parameter selector
 
 ---
 
+## 🎛️ Engine tuning (Bloom 2.0 roundtable)
+
+Measured rationale for every flag: [docs/ENGINE-ROUNDTABLE.md](docs/ENGINE-ROUNDTABLE.md).
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PREBUFFER_SECONDS` | `0` (off → `PREBUFFER_BYTES`) | Join burst measured in **seconds of audio per tier** (`seconds × tier kbps × 125` bytes). `10` ≈ 10 s behind live instead of ~65 s (opus 192k) with `PREBUFFER_BYTES=1572864`. |
+| `LOUDNESS_NORMALIZATION` | `false` | Per-track static gain toward `LOUDNESS_TARGET_LUFS` (ITU-R BS.1770 / EBU R128 measurement, cached). No compression/limiting. |
+| `LOUDNESS_TARGET_LUFS` | `-16` | Integrated loudness target. |
+| `LOUDNESS_TRUE_PEAK_DBTP` | `-1` | Gain is capped so the track's true peak stays at or below this ceiling. |
+| `LOUDNESS_MAX_GAIN_DB` | `12` | Maximum positive gain (quiet tracks / TTS). |
+| `SMART_TRANSITIONS` | `false` | Skips leading digital silence and starts the crossfade where the trailing silence begins (same analysis pass). |
+| `SILENCE_THRESHOLD_DB` | `-50` | Silence threshold for `SMART_TRANSITIONS`. |
+| `ANALYSIS_PRESCAN` | `true` | With loudness/smart enabled, analyse the whole fallback folder in the background (`nice`, 1 thread, one file at a time). |
+| `ANALYSIS_CACHE_FILE` | `.analysis-cache.json` | Analysis cache (path + mtime). Mount it on a volume to keep it across container recreations. |
+| `CROSSFADE_SAMPLE_CLOCK` | `true` | Crossfade timed by samples (not wall clock) + lossless deck handover. `false` restores the old behaviour. |
+| `DECK_FFLAGS_NOBUFFER` | `false` | `true` restores the old `-fflags nobuffer` on deck ffmpeg (which drops ~1.2 s at the start of every MP3). |
+| `FALLBACK_STALL_SECONDS` | `5` | Skip to the next track if no PCM reached the encoder for N s while not live (hung deck). `0` disables. |
+| `ENCODER_SUPERVISION` | `true` | Restart the Opus encoder with exponential backoff (1 s → 30 s) if it dies or stops emitting pages for 10 s. |
+
+New observability: `/status` and `/health` include an `engine` block (current track loudness/gain, prebuffer seconds per tier, join backlog, dead air, crossfade results, encoder restarts). `/metrics` adds `radio_dead_air_seconds_total`, `radio_digital_silence_seconds_total`, `radio_fallback_stall_restarts_total`, `radio_opus_encoder_restarts_total`, `radio_crossfades_total{result}`, `radio_prebuffer_seconds{tier}`, `radio_listener_join_backlog_seconds_*`, `radio_audio_clock_drift_seconds`.
+
+---
+
 ## 📡 OBS Studio (Live SRT Ingestion)
 
 1. Open **OBS Studio** → **Settings** → **Stream**

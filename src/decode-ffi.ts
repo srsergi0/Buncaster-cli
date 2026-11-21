@@ -1,5 +1,6 @@
 import { dlopen, ptr } from "bun:ffi";
 import { rtmpLog } from "./logger";
+import { Event, ErrorCode } from "./events";
 
 // =============================================================
 // DECODIFICADOR NATIVO — FFI libavformat + libavcodec + swresample
@@ -170,14 +171,14 @@ function loadLibs(): Symbols | null {
         const libUtil = dlopen(paths.avutil, defAvutil);
         const libSwr = dlopen(paths.swresample, defSwr);
         const all = { ...libFmt.symbols, ...libCodec.symbols, ...libUtil.symbols, ...libSwr.symbols } as unknown as Symbols;
-        rtmpLog.info(`[NativeDecoder] libavformat ${major} cargada (${paths.avformat}). Decks sin proceso ffmpeg.`);
+        rtmpLog.ok(Event.nativeDecodeLoaded, `libavformat ${major} cargada; decks sin ffmpeg`, { version: major, path: paths.avformat });
         return all;
       } catch {
         // probar siguiente versión
       }
     }
   }
-  rtmpLog.warn("[NativeDecoder] No se pudo cargar libavformat. Decks con ffmpeg CLI.");
+  rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar libavformat; decks con ffmpeg CLI");
   return null;
 }
 
@@ -308,7 +309,7 @@ export class NativeDecoder {
           this.run(st, controller)
             .then(() => resolve(0))
             .catch((err) => {
-              rtmpLog.error("[NativeDecoder] error en bucle de decode:", err);
+              rtmpLog.fail(ErrorCode.decode, "Error en bucle de decode nativo", { error: err instanceof Error ? err.message : String(err) });
               try { controller.error(err); } catch { /* noop */ }
               resolve(1);
             });
@@ -416,6 +417,6 @@ symbols = loadLibs();
 
 // memcpy de libc para leer memoria C (toArrayBuffer roto en Bun 1.3)
 if (!loadMemcpy()) {
-  rtmpLog.warn("[NativeDecoder] No se pudo cargar memcpy de libc. Decks con ffmpeg CLI.");
+  rtmpLog.event("warn", Event.nativeFallback, "No se pudo cargar memcpy de libc; decks con ffmpeg CLI");
   symbols = null;
 }

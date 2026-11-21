@@ -1,6 +1,7 @@
 import { config } from "./config";
 import { state } from "./state";
 import { rtmpLog } from "./logger";
+import { Event } from "./events";
 
 export interface Mp3FrameInfo {
   bitrateKbps: number;
@@ -82,10 +83,7 @@ export class BitrateDetector {
     if (this.acc.byteLength > this.maxAccBytes) {
       this.done = true;
       this.acc = null;
-      rtmpLog.warn(
-        `No se pudo autodetectar el bitrate del MP3 tras ${this.maxAccBytes} bytes; ` +
-        `usando predeterminado de ${config.fallbackBitrateKbps}kbps`
-      );
+      rtmpLog.event("warn", Event.error, `No se pudo autodetectar el bitrate del MP3 tras ${this.maxAccBytes} bytes; usando ${config.fallbackBitrateKbps}kbps`, { defaultKbps: config.fallbackBitrateKbps });
     }
   }
 
@@ -97,5 +95,5 @@ export class BitrateDetector {
 export const bitrateDetector = new BitrateDetector((info) => {
   state.detectedBitrateKbps = info.bitrateKbps;
   state.detectedSampleRate = info.sampleRate;
-  rtmpLog.debug(`Detected real bitrate: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`);
+  rtmpLog.event("debug", Event.sourceConnected, `Bitrate real detectado: ${info.bitrateKbps}kbps @ ${info.sampleRate}Hz`, { bitrateKbps: info.bitrateKbps, sampleRate: info.sampleRate });
 });

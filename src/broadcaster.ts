@@ -157,11 +157,15 @@ export function broadcast(chunk: Uint8Array): void {
   }
 }
 
-export function broadcastOpus(chunk: Uint8Array): void {
+/**
+ * @param toPrebuffer false para páginas de cabecera Ogg: se envían en banda a los
+ *        oyentes conectados pero no entran al prebuffer (los nuevos las reciben aparte).
+ */
+export function broadcastOpus(chunk: Uint8Array, toPrebuffer = true): void {
   if (chunk.byteLength === 0) return;
 
   // Una sola copia inmutable administrada por el RingBuffer al publicar
-  const slot = preBufferOpus.push(chunk);
+  const slot = toPrebuffer ? preBufferOpus.push(chunk) : null;
   const data = slot ? slot.data : new Uint8Array(chunk);
 
   if (state.opusClients.size === 0) return;

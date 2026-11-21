@@ -18,6 +18,14 @@ export interface ActiveTrackInfo {
   artist: string;
   duration: number; // en segundos
   startedAt: number; // timestamp ms
+  /** Análisis BS.1770 aplicado a esta pista (si LOUDNESS_NORMALIZATION / SMART_TRANSITIONS). */
+  loudness?: {
+    integratedLufs: number;
+    truePeakDbtp: number;
+    gainDb: number;
+    leadSkipSec: number;
+    tailStartSec: number | null;
+  } | null;
 }
 
 export type DeckState = "IDLE" | "PRELOADING" | "READY" | "PLAYING" | "CROSSFADING" | "DRAINING" | "STOPPED";
@@ -54,6 +62,25 @@ export const state = {
   lastSourceAudioTimeMs: 0,
   lastPcmSampleTimeMs: 0,
   evictionsTotal: { slowClient: 0, backpressure: 0, timeout: 0 },
+
+  // Engine roundtable: aire muerto, supervisión y latencia
+  /** Segundos acumulados en que el encoder no recibió PCM (huecos > 500 ms). */
+  deadAirSeconds: 0,
+  deadAirEvents: 0,
+  /** Segundos de PCM emitido por debajo de -60 dBFS de pico (silencio digital). */
+  digitalSilenceSeconds: 0,
+  fallbackStallRestarts: 0,
+  opusEncoderRestarts: 0,
+  opusEncoderGeneration: 0,
+  crossfadesCompleted: 0,
+  crossfadesTruncated: 0,
+  handoverDrainedBytes: 0,
+  /** Bytes que el deck entrante no tenía listos durante un crossfade (rellenados con silencio). */
+  crossfadeUnderrunBytes: 0,
+  /** Backlog (segundos de audio) entregado a cada oyente al conectar: suma y conteo. */
+  joinBacklogSecondsSum: 0,
+  joinBacklogCount: 0,
+  joinBacklogSecondsMax: 0,
 
   fallbackQueue: [] as string[],
   currentTrack: null as ActiveTrackInfo | null,

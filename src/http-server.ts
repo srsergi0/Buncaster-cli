@@ -2,6 +2,7 @@ import { config } from "./config";
 import { state } from "./state";
 import { preBuffer, preBufferOpus } from "./pre-buffer";
 import { httpLog } from "./logger";
+import { Event, ErrorCode } from "./events";
 import { getNowPlayingInfo, getCurrentTitle } from "./broadcaster";
 
 // Rutas literales: /mp3 (320k) y /opus (96k) — solo estas
@@ -25,6 +26,8 @@ import {
   stopAudioWatchdog,
 } from "./audio-router";
 import { flushLogsSync } from "./logger";
+import { audioClockDriftSeconds } from "./audio-router";
+import { analysisQueueStats } from "./track-analysis";
 
 import { StreamableHttpTransport, InMemorySessionAdapter } from "mcp-lite";
 import { mcpServer } from "./mcp-server";
@@ -49,16 +52,16 @@ function tryServe(port: number, retries = 5): ReturnType<typeof Bun.serve> {
         port: p,
         idleTimeout: 0,
         async fetch(req: Request, server: any) { return (globalThis as any).__bunServeFetch(req, server); },
-        error(err: any) { httpLog.error("Error in HTTP server:", err); return new Response("Internal Server Error", { status: 500 }); }
+        error(err: any) { httpLog.fail(ErrorCode.server, "Error en el servidor HTTP", { error: String(err) }); return new Response("Internal Server Error", { status: 500 }); }
       } as any);
       if (p !== port) {
-        httpLog.warn(`Port ${port} in use, using ${p} instead`);
+        httpLog.event("warn", Event.serverPortBusy, `Puerto ${port} ocupado; usando ${p}`, { requested: port, used: p });
         (config as any).httpPort = p;
       }
       return s;
     } catch (e: any) {
       if (e?.code === "EADDRINUSE" || String(e).includes("in use")) {
-        httpLog.warn(`Port ${p} in use, trying ${p+1}...`);
+        httpLog.event("warn", Event.serverPortBusy, `Puerto ${p} ocupado; probando ${p + 1}...`, { requested: p, next: p + 1 });
         continue;
       }
       throw e;
@@ -95,9 +98,53 @@ async function getOrBuildAppJs(): Promise<string> {
   return appJsBuilding;
 }
 
+/** Estado del motor (sonoridad, latencia, aire muerto, supervisión) para /status y /health. */
+function engineStatus() {
+  const track = state.currentTrack;
+  return {
+    loudness: {
+      normalization: config.loudnessNormalization,
+      targetLufs: config.loudnessTargetLufs,
+      truePeakCeilingDbtp: config.loudnessTruePeakDbtp,
+      smartTransitions: config.smartTransitions,
+      currentTrack: !state.isBroadcasting && track?.loudness ? track.loudness : null,
+      analysis: analysisQueueStats(),
+    },
+    latency: {
+      prebufferSecondsMp3: Math.round(preBuffer.secondsFor(preBuffer.capacityBytes) * 10) / 10,
+      prebufferSecondsOpus: Math.round(preBufferOpus.secondsFor(preBufferOpus.capacityBytes) * 10) / 10,
+      prebufferBytesMp3: preBuffer.capacityBytes,
+      prebufferBytesOpus: preBufferOpus.capacityBytes,
+      joinBacklogSecondsAvg: state.joinBacklogCount > 0 ? Math.round((state.joinBacklogSecondsSum / state.joinBacklogCount) * 10) / 10 : 0,
+      joinBacklogSecondsMax: Math.round(state.joinBacklogSecondsMax * 10) / 10,
+      audioClockDriftSeconds: Math.round(audioClockDriftSeconds() * 100) / 100,
+    },
+    air: {
+      deadAirSeconds: Math.round(state.deadAirSeconds * 10) / 10,
+      deadAirEvents: state.deadAirEvents,
+      digitalSilenceSeconds: Math.round(state.digitalSilenceSeconds * 10) / 10,
+      fallbackStallRestarts: state.fallbackStallRestarts,
+    },
+    crossfade: {
+      sampleClock: config.crossfadeSampleClock,
+      completed: state.crossfadesCompleted,
+      truncated: state.crossfadesTruncated,
+      handoverBufferedBytes: state.handoverDrainedBytes,
+      underrunBytes: state.crossfadeUnderrunBytes,
+    },
+    supervision: {
+      enabled: config.encoderSupervision,
+      opusEncoderRestarts: state.opusEncoderRestarts,
+      opusEncoderGeneration: state.opusEncoderGeneration,
+    },
+  };
+}
+
 // Store fetch handler for tryServe wrapper
 (globalThis as any).__bunServeFetch = async (req: Request, server: any) => {
-  const url = new URL(req.url);
+  // Base explícita: peticiones sin Host (HTTP/1.0, escáneres) traen req.url relativo
+  // y `new URL("/")` lanzaba TypeError → 500 + traza en el log por cada una.
+  const url = new URL(req.url, "http://localhost");
   const path = url.pathname;
 
   // Aislamiento del puerto de salida: si config.outputPort !== config.dashboardPort y la petición viene por outputServer,
@@ -178,7 +225,14 @@ async function getOrBuildAppJs(): Promise<string> {
         const shouldSendPreBuffer = !config.lowLatency || !state.isBroadcasting;
         if (shouldSendPreBuffer) {
           const currentTitle = getCurrentTitle();
-          for (const chunk of chosenPreBuffer.snapshot()) {
+          const snap = chosenPreBuffer.snapshot();
+          let snapBytes = 0;
+          for (const c of snap) snapBytes += c.byteLength;
+          const backlogSec = chosenPreBuffer.secondsFor(snapBytes);
+          state.joinBacklogSecondsSum += backlogSec;
+          state.joinBacklogCount++;
+          if (backlogSec > state.joinBacklogSecondsMax) state.joinBacklogSecondsMax = backlogSec;
+          for (const chunk of snap) {
             try {
               if (icyState) {
                 const pieces = chunkWithIcy(chunk, icyState, currentTitle);
@@ -203,7 +257,7 @@ async function getOrBuildAppJs(): Promise<string> {
         state.listenersMp3 = state.mp3Clients.size;
         state.listenersOpus = state.opusClients.size;
         state.totalListenersServed++;
-        httpLog.info(`Listener connected: ${clientId} tier=${tier} desde ${ip} (${state.clients.size} activos mp3:${state.listenersMp3} opus:${state.listenersOpus})`);
+        httpLog.ok(Event.listenerConnected, `Listener conectado (tier ${tier})`, { clientId, tier, ip, total: state.clients.size, mp3: state.listenersMp3, opus: state.listenersOpus });
       },
       cancel() {
         state.clients.delete(clientId);
@@ -211,10 +265,12 @@ async function getOrBuildAppJs(): Promise<string> {
         state.opusClients.delete(clientId);
         state.listenersMp3 = state.mp3Clients.size;
         state.listenersOpus = state.opusClients.size;
-        httpLog.info(`Listener disconnected: ${clientId} tier=${tier} (${state.clients.size} activos)`);
+        httpLog.ok(Event.listenerDisconnected, `Listener desconectado (tier ${tier})`, { clientId, tier, total: state.clients.size });
       },
     }, {
-      highWaterMark: config.lowLatency ? 64 * 1024 : config.preBufferBytes + 256 * 1024,
+      // Medido (ENGINE-ROUNDTABLE): subir el HWM al tamaño del prebuffer elevaba el RSS de
+      // ~68 MB a ~120 MB con 200 oyentes sin evitar ninguna expulsión; se mantiene 64 KB.
+      highWaterMark: config.lowLatency ? 64 * 1024 : chosenPreBuffer.capacityBytes + 256 * 1024,
       size(chunk: Uint8Array) {
         return chunk.byteLength;
       },
@@ -356,7 +412,10 @@ async function getOrBuildAppJs(): Promise<string> {
     const sourceAlive = state.sourceProcess !== null;
     const opusCount = state.listenersOpus;
     const mp3Count = state.listenersMp3;
-    const audioStalled = state.audioClockSamples === 0 && uptimeSeconds > 5 && !state.fallbackPaused;
+    // También "degraded" si hay aire muerto en curso (sin PCM > 2 s fuera de pausa):
+    // antes /health seguía en "ok" con un deck colgado y la radio muda.
+    const deadAirNow = !state.fallbackPaused && state.lastPcmSampleTimeMs > 0 && Date.now() - state.lastPcmSampleTimeMs > 2000;
+    const audioStalled = (state.audioClockSamples === 0 && uptimeSeconds > 5 && !state.fallbackPaused) || deadAirNow;
     const overallStatus = audioStalled ? "degraded" : "ok";
     return Response.json({
       status: overallStatus,
@@ -405,6 +464,7 @@ async function getOrBuildAppJs(): Promise<string> {
         mp3: { bitrate: config.fallbackBitrateKbps, mime: FORMAT_CONFIG[config.streamFormat].mime },
         opus: config.opusTierEnabled ? { bitrate: config.opusTierBitrateKbps, mime: FORMAT_CONFIG["opus"].mime } : null,
       },
+      engine: engineStatus(),
     }, { headers: corsHeaders() });
   }
   if (path === "/debug-state") {
@@ -437,7 +497,8 @@ async function getOrBuildAppJs(): Promise<string> {
       fallbackBitrateKbps: config.fallbackBitrateKbps,
       opusTierBitrateKbps: config.opusTierBitrateKbps,
       opusTierEnabled: config.opusTierEnabled,
-      fallbackActive: !state.isBroadcasting && state.currentTrack !== null
+      fallbackActive: !state.isBroadcasting && state.currentTrack !== null,
+      engine: engineStatus(),
     }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
@@ -489,6 +550,45 @@ async function getOrBuildAppJs(): Promise<string> {
       "# HELP radio_deck_state_b Estado de deck B",
       "# TYPE radio_deck_state_b gauge",
       `radio_deck_state_b{state="${state.deckState.B}"} 1`,
+      "# HELP radio_dead_air_seconds_total Segundos sin PCM hacia el encoder (huecos > 500 ms)",
+      "# TYPE radio_dead_air_seconds_total counter",
+      `radio_dead_air_seconds_total ${state.deadAirSeconds.toFixed(3)}`,
+      "# HELP radio_dead_air_events_total Huecos de PCM > 500 ms",
+      "# TYPE radio_dead_air_events_total counter",
+      `radio_dead_air_events_total ${state.deadAirEvents}`,
+      "# HELP radio_digital_silence_seconds_total Segundos emitidos con pico < -60 dBFS",
+      "# TYPE radio_digital_silence_seconds_total counter",
+      `radio_digital_silence_seconds_total ${state.digitalSilenceSeconds.toFixed(3)}`,
+      "# HELP radio_fallback_stall_restarts_total Reinicios del fallback por watchdog de audio",
+      "# TYPE radio_fallback_stall_restarts_total counter",
+      `radio_fallback_stall_restarts_total ${state.fallbackStallRestarts}`,
+      "# HELP radio_opus_encoder_restarts_total Reinicios supervisados del encoder opus",
+      "# TYPE radio_opus_encoder_restarts_total counter",
+      `radio_opus_encoder_restarts_total ${state.opusEncoderRestarts}`,
+      "# HELP radio_crossfades_total Crossfades por resultado",
+      "# TYPE radio_crossfades_total counter",
+      `radio_crossfades_total{result="completed"} ${state.crossfadesCompleted}`,
+      `radio_crossfades_total{result="truncated"} ${state.crossfadesTruncated}`,
+      "# HELP radio_deck_handover_buffered_bytes_total PCM precargado en el deck entrante al relevo (drenado con CROSSFADE_SAMPLE_CLOCK, descartado sin él)",
+      "# TYPE radio_deck_handover_buffered_bytes_total counter",
+      `radio_deck_handover_buffered_bytes_total ${state.handoverDrainedBytes}`,
+      "# HELP radio_crossfade_underrun_bytes_total PCM que faltó del deck entrante durante crossfades (relleno con silencio)",
+      "# TYPE radio_crossfade_underrun_bytes_total counter",
+      `radio_crossfade_underrun_bytes_total ${state.crossfadeUnderrunBytes}`,
+      "# HELP radio_prebuffer_seconds Segundos de audio de prebuffer por tier (latencia tras el directo al conectar)",
+      "# TYPE radio_prebuffer_seconds gauge",
+      `radio_prebuffer_seconds{tier="mp3"} ${preBuffer.secondsFor(preBuffer.capacityBytes).toFixed(2)}`,
+      `radio_prebuffer_seconds{tier="opus"} ${preBufferOpus.secondsFor(preBufferOpus.capacityBytes).toFixed(2)}`,
+      "# HELP radio_listener_join_backlog_seconds Backlog entregado al conectar (resumen)",
+      "# TYPE radio_listener_join_backlog_seconds summary",
+      `radio_listener_join_backlog_seconds_sum ${state.joinBacklogSecondsSum.toFixed(3)}`,
+      `radio_listener_join_backlog_seconds_count ${state.joinBacklogCount}`,
+      "# HELP radio_listener_join_backlog_seconds_max Mayor backlog entregado al conectar",
+      "# TYPE radio_listener_join_backlog_seconds_max gauge",
+      `radio_listener_join_backlog_seconds_max ${state.joinBacklogSecondsMax.toFixed(3)}`,
+      "# HELP radio_audio_clock_drift_seconds Audio emitido menos tiempo de pared (positivo = más rápido que tiempo real)",
+      "# TYPE radio_audio_clock_drift_seconds gauge",
+      `radio_audio_clock_drift_seconds ${audioClockDriftSeconds().toFixed(3)}`,
     ];
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }
@@ -501,7 +601,7 @@ export const outputServer = config.outputPort !== config.dashboardPort ? tryServ
 export async function gracefulShutdown(exitCode = 0): Promise<void> {
   if (state.shuttingDown) return;
   state.shuttingDown = true;
-  httpLog.info("Iniciando apagado ordenado (graceful shutdown)...");
+  httpLog.ok(Event.serverShutdown, "Iniciando apagado ordenado (graceful shutdown)...");
 
   for (const [id, client] of state.clients) {
     try {

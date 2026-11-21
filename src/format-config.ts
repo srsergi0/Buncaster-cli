@@ -1,4 +1,5 @@
 import { rtmpLog } from "./logger";
+import { Event, ErrorCode, hintFor } from "./events";
 
 export type StreamFormat = "mp3" | "ogg" | "aac" | "flac" | "opus";
 
@@ -63,6 +64,8 @@ export function validateFormat(format: StreamFormat): StreamFormat {
   if (FORMAT_CONFIG[format] && isCodecAvailable(format)) {
     return format;
   }
-  rtmpLog.warn(`Codec for "${format}" not available, fallback to MP3`);
+  if (format !== "mp3") {
+    rtmpLog.event("warn", Event.error, `Códec "${format}" no disponible; usando MP3`, { code: ErrorCode.codecMissing, hint: hintFor(ErrorCode.codecMissing), format });
+  }
   return "mp3";
 }

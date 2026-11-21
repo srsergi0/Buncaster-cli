@@ -8,6 +8,10 @@ import { bitrateDetector } from "./bitrate-detector";
 import { LameEncoder, isNativeLameAvailable } from "./lame-ffi";
 import { NativeDecoder, isNativeDecodeAvailable } from "./decode-ffi";
 import { FORMAT_CONFIG } from "./format-config";
+import { Event, ErrorCode, missingBinaryCode } from "./events";
+import { preBufferOpus } from "./pre-buffer";
+import { OggPageAssembler, OpusHeaderCollector } from "./ogg";
+import { analysisEnabled, getCachedAnalysis, planTrack, requestAnalysis, type TrackPlan } from "./track-analysis";
 
 export let opusHeaders: Uint8Array | null = null;
 
@@ -122,6 +126,12 @@ export interface Deck {
   process: any | null;
   currentTrackFile: string | null;
   pendingTrackMeta: { file: string; title: string; artist: string; duration: number } | null;
+  /** Frames (48 kHz estéreo) de esta pista ya emitidos al master: reloj por muestras. */
+  framesOut: number;
+  /** Duración del archivo según ffprobe (s), 0 si aún se desconoce. */
+  durationSec: number;
+  /** Plan de reproducción derivado del análisis (ganancia, salto de intro, fin efectivo). */
+  plan: TrackPlan | null;
 }
 
 export const deckA: Deck = {
@@ -135,6 +145,9 @@ export const deckA: Deck = {
   process: null,
   currentTrackFile: null,
   pendingTrackMeta: null,
+  framesOut: 0,
+  durationSec: 0,
+  plan: null,
 };
 
 export const deckB: Deck = {
@@ -148,6 +161,9 @@ export const deckB: Deck = {
   process: null,
   currentTrackFile: null,
   pendingTrackMeta: null,
+  framesOut: 0,
+  durationSec: 0,
+  plan: null,
 };
 
 export let fallbackPlaylist: string[] = [];
@@ -164,6 +180,17 @@ let liveTransitionStartTime = 0;
 
 let isFallbackFadeInActive = false;
 let fallbackFadeInStartTime = 0;
+
+// Reloj por muestras del crossfade (CROSSFADE_SAMPLE_CLOCK)
+const SAMPLE_RATE = 48000;
+let crossfadeFramesDone = 0;
+let crossfadeTotalFrames = 0;
+/**
+ * Si el deck saliente llega a EOF antes de acabar el fundido, el entrante pasa a
+ * conducir el reloj y completa la rampa mezclando lo que quedaba del saliente
+ * (`leftover`), sin insertar silencios en la pista entrante.
+ */
+let tailFadeIn: { done: number; total: number; leftover: AudioStreamBuffer | null } | null = null;
 
 export let isStoppingFallback = false;
 
@@ -311,10 +338,46 @@ function applyVolume(chunk: Uint8Array, volume: number): Uint8Array {
   return new Uint8Array(outBuffer, 0, byteLength);
 }
 
+// Aire muerto: huecos sin PCM hacia el encoder; silencio digital: pico < -60 dBFS
+const DEAD_AIR_GAP_MS = 500;
+const DIGITAL_SILENCE_PEAK = 33; // ≈ -60 dBFS en s16
+let firstPcmTimeMs = 0;
+
+export function accountAirTime(chunk: Uint8Array, now: number): void {
+  const last = state.lastPcmSampleTimeMs;
+  if (last > 0) {
+    const gap = now - last;
+    if (gap > DEAD_AIR_GAP_MS) {
+      state.deadAirSeconds += gap / 1000;
+      state.deadAirEvents++;
+    }
+  }
+  const samples = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength >> 1);
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i]!;
+    const a = v < 0 ? -v : v;
+    if (a > peak) {
+      peak = a;
+      if (peak >= DIGITAL_SILENCE_PEAK) break;
+    }
+  }
+  if (peak < DIGITAL_SILENCE_PEAK) state.digitalSilenceSeconds += (chunk.byteLength >> 2) / SAMPLE_RATE;
+}
+
+/** Deriva del reloj de audio respecto al reloj de pared (s). Positivo = se emite más rápido que el tiempo real. */
+export function audioClockDriftSeconds(now = Date.now()): number {
+  if (firstPcmTimeMs === 0) return 0;
+  return state.audioSamplesProduced / SAMPLE_RATE - (now - firstPcmTimeMs) / 1000;
+}
+
 function writeToMaster(chunk: Uint8Array) {
   if (chunk.byteLength === 0) return;
 
-  state.lastPcmSampleTimeMs = Date.now();
+  const nowMs = Date.now();
+  if (firstPcmTimeMs === 0) firstPcmTimeMs = nowMs;
+  accountAirTime(chunk, nowMs);
+  state.lastPcmSampleTimeMs = nowMs;
 
   // Actualizar métricas del reloj multimedia basado en muestras (1 frame = 4 bytes stereo s16le)
   const frames = Math.floor(chunk.byteLength / 4);
@@ -357,6 +420,35 @@ function writeToMaster(chunk: Uint8Array) {
       /* noop */
     }
   }
+}
+
+/** Publica los metadatos pendientes del deck como pista actual (en el momento de emisión). */
+function activateTrackMeta(deck: Deck): void {
+  if (!deck.pendingTrackMeta) return;
+  const plan = deck.plan;
+  state.currentTrack = {
+    file: deck.pendingTrackMeta.file,
+    title: deck.pendingTrackMeta.title,
+    artist: deck.pendingTrackMeta.artist,
+    duration: deck.pendingTrackMeta.duration,
+    startedAt: Date.now(),
+    loudness: plan && plan.analyzed ? {
+      integratedLufs: plan.integratedLufs ?? 0,
+      truePeakDbtp: plan.truePeakDbtp ?? 0,
+      gainDb: plan.gainDb,
+      leadSkipSec: plan.leadSkipSec,
+      tailStartSec: plan.tailStartSec,
+    } : null,
+  };
+  deck.pendingTrackMeta = null;
+}
+
+/** Segundos (en tiempo del deck) en los que la música de la pista termina. 0 = desconocido. */
+function deckEndSec(deck: Deck, metaDuration: number): number {
+  if (deck.plan?.endSec) return deck.plan.endSec;
+  const dur = metaDuration > 0 ? metaDuration : deck.durationSec;
+  if (dur <= 0) return 0;
+  return dur - (deck.plan?.leadSkipSec ?? 0);
 }
 
 export function reshufflePlaylist() {
@@ -457,7 +549,7 @@ function initializeFallbackSource() {
       const audioFiles = getAudioFilesRecursive(config.fallbackSource);
 
       if (audioFiles.length === 0) {
-        rtmpLog.info(`🔇 No music files in "${config.fallbackSource}" — playing silence until you go live.`);
+        rtmpLog.ok(Event.fallbackSilence, "Sin archivos de música: silencio hasta que haya directo", { source: config.fallbackSource });
         fallbackPlaylist = [];
         return;
       }
@@ -466,15 +558,15 @@ function initializeFallbackSource() {
       shuffle(fallbackPlaylist);
       currentPlaylistIndex = 0;
       isPlaylistInitialized = true;
-      rtmpLog.info(`🎵 Found ${audioFiles.length} songs in "${config.fallbackSource}"`);
+      rtmpLog.ok(Event.fallbackScan, `Encontradas ${audioFiles.length} canciones`, { source: config.fallbackSource, count: audioFiles.length });
     } else {
       fallbackPlaylist = [config.fallbackSource];
       currentPlaylistIndex = 0;
       isPlaylistInitialized = true;
-      rtmpLog.info(`🎵 Found 1 song: ${config.fallbackSource}`);
+      rtmpLog.ok(Event.fallbackScan, "Fallback de un solo archivo", { source: config.fallbackSource, count: 1 });
     }
   } catch (err) {
-    rtmpLog.info(`🔇 Music folder "${config.fallbackSource}" not found — playing silence until you go live.`);
+    rtmpLog.fail(ErrorCode.fallbackDir, `Carpeta de fallback no encontrada: "${config.fallbackSource}"`, { source: config.fallbackSource });
     rtmpLog.debug(`FALLBACK_SOURCE stat failed: ${(err as Error).message}`);
     fallbackPlaylist = [];
   }
@@ -715,7 +807,7 @@ export function checkAudioWatchdog(now = Date.now()): boolean {
 
   const silenceDurationMs = now - state.lastSourceAudioTimeMs;
   if (silenceDurationMs > 2500) {
-    rtmpLog.warn(`[Audio Watchdog] Frozen live audio detected (${silenceDurationMs}ms with zero frames). Forcing failover to fallback.`);
+    rtmpLog.event("warn", Event.sourceAudioFrozen, `Audio en vivo congelado (${silenceDurationMs}ms sin frames). Forzando failover a fallback.`, { silenceMs: silenceDurationMs });
     state.audioUnderruns++;
     state.isBroadcasting = false;
     state.sourceConnected = false;
@@ -736,6 +828,39 @@ export function checkAudioWatchdog(now = Date.now()): boolean {
   return false;
 }
 
+// -------------------------------------------------------------
+// Watchdog del fallback (FALLBACK_STALL_SECONDS): si no hay directo, no
+// está en pausa y el encoder lleva N s sin recibir PCM (deck colgado,
+// ffmpeg bloqueado, spawn fallido…), se fuerza el salto a la siguiente
+// pista. Sin esto, un deck colgado deja la radio muda indefinidamente.
+// -------------------------------------------------------------
+let lastFallbackStallRestartMs = 0;
+
+function restartFallbackAfterStall(): void {
+  // SIGKILL: un proceso detenido (SIGSTOP) ignora SIGTERM hasta que se reanuda
+  for (const d of [deckA, deckB]) {
+    if (d.process) { try { d.process.kill(9); } catch { /* noop */ } }
+  }
+  actionSkipFallback();
+}
+
+export function checkFallbackWatchdog(now = Date.now(), restart: () => void = restartFallbackAfterStall): boolean {
+  const stallMs = config.fallbackStallSeconds * 1000;
+  if (stallMs <= 0) return false;
+  if (state.isBroadcasting || state.shuttingDown || state.fallbackPaused) return false;
+  if (state.lastPcmSampleTimeMs === 0) return false; // aún no arrancó el audio
+  const silentMs = now - state.lastPcmSampleTimeMs;
+  if (silentMs < stallMs) return false;
+  if (now - lastFallbackStallRestartMs < stallMs) return false; // un reintento por ventana
+  lastFallbackStallRestartMs = now;
+  state.fallbackStallRestarts++;
+  rtmpLog.event("warn", Event.fallbackStalled, `Fallback sin audio hace ${silentMs}ms; saltando a la siguiente pista`, {
+    silentMs, deckA: deckA.state, deckB: deckB.state, track: deckA.currentTrackFile ?? deckB.currentTrackFile,
+  });
+  restart();
+  return true;
+}
+
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 export function startAudioWatchdog() {
   if (watchdogTimer) return;
@@ -748,6 +873,8 @@ export function startAudioWatchdog() {
       return;
     }
     checkAudioWatchdog();
+    checkFallbackWatchdog();
+    checkOpusStall();
   }, 1000);
 }
 
@@ -775,16 +902,11 @@ export function startMasterEncoder() {
         2, // quality 2 = buena calidad (0=mejor, 9=más rápido)
       );
       nativeEncoder = { encoder };
-      rtmpLog.debug(
-        `[Master Encoder] Native mode active (LAME-FFI) at ${config.fallbackBitrateKbps}kbps. No ffmpeg process.`,
-      );
+      rtmpLog.ok(Event.encoderMasterStarted, `Encoder master nativo LAME-FFI @ ${config.fallbackBitrateKbps}kbps (sin ffmpeg)`, { engine: "lame-ffi", bitrateKbps: config.fallbackBitrateKbps });
       if (config.opusTierEnabled) startOpusEncoder();
       return;
     } catch (err) {
-      rtmpLog.error(
-        "[Master Encoder] Error iniciando LAME nativo, fallback a ffmpeg:",
-        (err as Error).message,
-      );
+      rtmpLog.fail(ErrorCode.ffmpegSpawn, "Error iniciando LAME nativo; se usará ffmpeg", { error: (err as Error).message });
     }
   }
 
@@ -795,7 +917,7 @@ export function startMasterEncoder() {
 
 function startFfmpegMasterEncoder() {
   const fmt = FORMAT_CONFIG[config.streamFormat];
-  rtmpLog.debug(`Starting FFmpeg Master Encoder [${config.streamFormat.toUpperCase()}] at ${config.fallbackBitrateKbps}kbps...`);
+  rtmpLog.ok(Event.encoderMasterStarted, `Encoder master [${config.streamFormat.toUpperCase()}] @ ${config.fallbackBitrateKbps}kbps`, { codec: fmt.codec, bitrateKbps: config.fallbackBitrateKbps });
 
   const args = [
     "-loglevel", "warning",
@@ -824,7 +946,8 @@ function startFfmpegMasterEncoder() {
     const processInstance = state.masterProcess;
     processInstance.exited.then((exitCode: number) => {
       if (state.masterProcess === processInstance) {
-        rtmpLog.debug(`[Master Encoder] ended (exit ${exitCode})`);
+        const okExit = exitCode === 0 || state.shuttingDown;
+        rtmpLog.event(okExit ? "info" : "warn", okExit ? Event.encoderMasterStopped : Event.encoderMasterCrashed, `Encoder master terminó (exit ${exitCode})`, { exitCode });
         try {
           reader.cancel();
         } catch {
@@ -836,7 +959,7 @@ function startFfmpegMasterEncoder() {
 
     pipeMaster(reader);
   } catch (err) {
-    rtmpLog.debug(`Master Encoder start failed: ${(err as Error).message}`);
+    rtmpLog.fail(missingBinaryCode(err) ?? ErrorCode.ffmpegSpawn, "No se pudo iniciar el encoder master ffmpeg", { error: (err as Error).message });
   }
 }
 
@@ -853,19 +976,68 @@ async function pipeMaster(reader: ReadableStreamDefaultReader<Uint8Array>) {
     }
   } catch (err) {
     if (!state.shuttingDown) {
-      rtmpLog.debug("Error reading Master Encoder output:", (err as Error).message);
+      rtmpLog.fail(ErrorCode.ffmpegSpawn, "Error leyendo la salida del encoder master", { error: (err as Error).message });
     }
   }
 }
 
 // --- Opus tier (moonshot per-listener efficiency) ---
+// Supervisión (ENCODER_SUPERVISION): si ffmpeg-opus muere o deja de producir
+// páginas mientras recibe PCM, se reinicia con backoff exponencial (1s→30s).
+// Cada arranque es una generación nueva: cabeceras y prebuffer se invalidan.
+let opusAssembler = new OggPageAssembler();
+const opusHeaderCollector = new OpusHeaderCollector();
+let opusIntentionalStop = false;
+let opusRestartTimer: ReturnType<typeof setTimeout> | null = null;
+let opusBackoffMs = 1000;
+let opusStartedAtMs = 0;
+let opusLastOutputMs = 0;
+const OPUS_BACKOFF_MAX_MS = 30_000;
+const OPUS_HEALTHY_RESET_MS = 60_000;
+export const OPUS_STALL_MS = 10_000;
+
+function resetOpusGeneration() {
+  opusHeaders = null;
+  opusHeaderCollector.reset();
+  opusAssembler = new OggPageAssembler();
+  preBufferOpus.reset();
+}
+
+export function scheduleOpusRestart(reason: string): number | null {
+  if (!config.encoderSupervision || !config.opusTierEnabled || state.shuttingDown) return null;
+  if (opusRestartTimer) return null;
+  if (opusStartedAtMs > 0 && Date.now() - opusStartedAtMs > OPUS_HEALTHY_RESET_MS) opusBackoffMs = 1000;
+  const delay = opusBackoffMs;
+  opusBackoffMs = Math.min(OPUS_BACKOFF_MAX_MS, opusBackoffMs * 2);
+  rtmpLog.event("warn", Event.encoderOpusRestart, `Reiniciando encoder opus en ${delay}ms (${reason})`, { delayMs: delay, reason });
+  opusRestartTimer = setTimeout(() => {
+    opusRestartTimer = null;
+    if (state.shuttingDown || state.opusProcess) return;
+    state.opusEncoderRestarts++;
+    startOpusEncoder();
+  }, delay);
+  return delay;
+}
+
+/** Detecta un encoder opus vivo pero colgado (no emite páginas mientras recibe PCM). */
+export function checkOpusStall(now = Date.now()): boolean {
+  if (!config.encoderSupervision || !state.opusProcess) return false;
+  if (now - opusStartedAtMs < OPUS_STALL_MS) return false;
+  const pcmFlowing = state.lastPcmSampleTimeMs > 0 && now - state.lastPcmSampleTimeMs < 2000;
+  const lastOut = opusLastOutputMs || opusStartedAtMs;
+  if (!pcmFlowing || now - lastOut < OPUS_STALL_MS) return false;
+  rtmpLog.event("warn", Event.encoderOpusStalled, `Encoder opus sin salida hace ${now - lastOut}ms con PCM entrando; matando proceso`, { silentMs: now - lastOut });
+  try { state.opusProcess.kill(9); } catch { /* noop */ }
+  return true;
+}
+
 export function startOpusEncoder() {
   if (state.opusProcess) return;
   if (!config.opusTierEnabled) return;
+  if (opusRestartTimer) { clearTimeout(opusRestartTimer); opusRestartTimer = null; }
   // Verificar codec disponible
   const opusFmt = FORMAT_CONFIG["opus"];
-  rtmpLog.debug(`Starting Opus Tier Encoder [OPUS] at ${config.opusTierBitrateKbps}kbps ...`);
-  rtmpLog.debug(`[Opus Debug] source pcm 48k s16le stereo -> libopus ${config.opusTierBitrateKbps}k, fallbackBitrate=${config.fallbackBitrateKbps}k`);
+  rtmpLog.ok(Event.encoderOpusStarted, `Encoder opus @ ${config.opusTierBitrateKbps}kbps`, { codec: opusFmt.codec, bitrateKbps: config.opusTierBitrateKbps });
   const args = [
     "-loglevel", "warning",
     "-fflags", "nobuffer",
@@ -879,25 +1051,35 @@ export function startOpusEncoder() {
     "-f", opusFmt.muxer,
     "-"
   ];
+  opusIntentionalStop = false;
+  resetOpusGeneration();
+  state.opusEncoderGeneration++;
   try {
     state.opusProcess = Bun.spawn(["ffmpeg", ...args], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     });
+    opusStartedAtMs = Date.now();
+    opusLastOutputMs = 0;
     drainProcessStderr(state.opusProcess, "OpusEncoder");
     const reader = state.opusProcess.stdout.getReader();
     const proc = state.opusProcess;
     proc.exited.then((code: number) => {
       if (state.opusProcess === proc) {
-        rtmpLog.debug(`[Opus Tier] process ended (exit ${code})`);
+        const okExit = code === 0 || state.shuttingDown;
+        rtmpLog.event(okExit ? "info" : "warn", okExit ? Event.encoderOpusStopped : Event.encoderOpusCrashed, `Encoder opus terminó (exit ${code})`, { exitCode: code });
         try { reader.cancel(); } catch {}
         state.opusProcess = null;
+        if (config.encoderSupervision) resetOpusGeneration(); // cabeceras/prebuffer de una generación muerta
+        if (!opusIntentionalStop) scheduleOpusRestart(`exit ${code}`);
       }
     }).catch(()=>{});
-    pipeOpus(reader);
+    pipeOpus(reader, proc);
   } catch (err) {
-    rtmpLog.debug("Error starting Opus Tier:", (err as Error).message);
+    rtmpLog.fail(missingBinaryCode(err) ?? ErrorCode.ffmpegSpawn, "No se pudo iniciar el encoder opus", { error: (err as Error).message });
+    state.opusProcess = null;
+    scheduleOpusRestart("spawn failed");
   }
 }
 
@@ -929,7 +1111,34 @@ export function extractOggOpusHeaders(buf: Uint8Array): Uint8Array | null {
 
 let opusPackets = 0;
 let opusBytesTotal = 0;
-async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
+
+/**
+ * Procesa la salida de ffmpeg-opus página a página: las páginas de cabecera
+ * (OpusHead + OpusTags) se acumulan en `opusHeaders` y no entran al prebuffer;
+ * las páginas de audio sí, de modo que un oyente nuevo recibe siempre
+ * cabeceras completas + páginas enteras de la generación actual.
+ */
+export function handleOpusOutput(value: Uint8Array): void {
+  const pages = opusAssembler.feed(value);
+  for (const page of pages) {
+    if (page.bos) {
+      // Stream lógico nuevo: lo previo pertenece a otra generación
+      preBufferOpus.reset();
+    }
+    const isHeader = opusHeaderCollector.accept(page);
+    if (isHeader) {
+      opusHeaders = opusHeaderCollector.headers;
+      if (page.magic.startsWith("OpusTags")) {
+        rtmpLog.debug(`[Opus Tier] Cabeceras Ogg/Opus completas: ${opusHeaders?.length ?? 0}B (gen ${state.opusEncoderGeneration})`);
+      }
+      broadcastOpus(page.data, false); // oyentes ya conectados la necesitan en banda
+      continue;
+    }
+    broadcastOpus(page.data);
+  }
+}
+
+async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>, proc?: any) {
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -937,26 +1146,14 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
         rtmpLog.debug("Opus stream closed");
         break;
       }
-      // Captura cabeceras OpusHead/OpusTags con parsing exacto de páginas Ogg
-      if (!opusHeaders) {
-        const exactHeaders = extractOggOpusHeaders(value);
-        if (exactHeaders) {
-          opusHeaders = exactHeaders;
-          rtmpLog.debug(`[Opus Tier] Exact Ogg/Opus header pages captured: ${opusHeaders.length}B`);
-        } else {
-          const text = new TextDecoder().decode(value.subarray(0, Math.min(value.length, 200)));
-          if (text.includes("OpusHead")) {
-            opusHeaders = value.slice();
-            rtmpLog.debug(`[Opus Tier] headers captured (fallback) ${opusHeaders.length}B`);
-          }
-        }
-      }
+      if (proc && state.opusProcess !== proc) break; // generación sustituida
+      opusLastOutputMs = Date.now();
       opusPackets++;
       opusBytesTotal += value.length;
       if (opusPackets % 200 === 0) {
         rtmpLog.debug(`[Opus Debug] pkt ${opusPackets} size ${value.length}B avg ${(opusBytesTotal/opusPackets).toFixed(1)}B total ${(opusBytesTotal/1024).toFixed(1)}KB`);
       }
-      broadcastOpus(value);
+      handleOpusOutput(value);
     }
   } catch (err) {
     if (!state.shuttingDown) rtmpLog.debug(`Error reading Opus: ${(err as Error).message}`);
@@ -964,15 +1161,16 @@ async function pipeOpus(reader: ReadableStreamDefaultReader<Uint8Array>) {
 }
 
 export function stopOpusEncoder() {
+  opusIntentionalStop = true;
+  if (opusRestartTimer) { clearTimeout(opusRestartTimer); opusRestartTimer = null; }
   if (!state.opusProcess) return;
-  rtmpLog.debug("Stopping Opus Tier...");
+  rtmpLog.ok(Event.encoderOpusStopped, "Deteniendo encoder opus");
   try {
     state.opusProcess.stdin.end();
     state.opusProcess.kill();
   } catch {}
   state.opusProcess = null;
-  opusHeaders = null;
-  preBufferOpus.reset();
+  resetOpusGeneration();
 }
 
 export function stopMasterEncoder() {
@@ -981,7 +1179,7 @@ export function stopMasterEncoder() {
 
   // --- Modo nativo ---
   if (nativeEncoder) {
-    rtmpLog.debug("Stopping Native Master Encoder...");
+    rtmpLog.ok(Event.encoderMasterStopped, "Deteniendo encoder master nativo (LAME-FFI)");
     const flushed = nativeEncoder.encoder.flush();
     if (flushed.length > 0) {
       bitrateDetector.feed(flushed);
@@ -994,7 +1192,7 @@ export function stopMasterEncoder() {
 
   // --- Modo ffmpeg ---
   if (!state.masterProcess) return;
-  rtmpLog.debug("Stopping FFmpeg Master Encoder...");
+  rtmpLog.ok(Event.encoderMasterStopped, "Deteniendo encoder master ffmpeg");
   try {
     state.masterProcess.stdin.end();
     state.masterProcess.kill();
@@ -1010,7 +1208,7 @@ function startSilence() {
   if (silenceInterval) return;
   if (state.isBroadcasting) return;
   startMasterEncoder();
-  rtmpLog.debug("Silence generator started (live-only)");
+  rtmpLog.event("debug", Event.fallbackSilence, "Generador de silencio iniciado (live-only)");
   const silenceChunk = new Uint8Array(4800 * 4); // 100ms s16le stereo 48k
   silenceInterval = setInterval(() => {
     if (state.isBroadcasting || state.shuttingDown) {
@@ -1045,7 +1243,7 @@ export function startFallback() {
   stopSilence();
   // No fallback: live-only silence
   if (!config.fallbackSource || config.fallbackSource.trim() === "") {
-    rtmpLog.info("🔇 No music — playing silence until you go live");
+    rtmpLog.ok(Event.fallbackSilence, "Sin música: silencio hasta que haya directo");
     startSilence();
     return;
   }
@@ -1065,6 +1263,8 @@ export function startFallback() {
   if (!isPlaylistInitialized) {
     initializeFallbackSource();
     startPlaylistWatcher();
+    // Barrido de fondo (nice, 1 hilo, en serie) para que todas las pistas lleguen analizadas
+    if (analysisEnabled() && config.analysisPrescan) requestAnalysis([...fallbackPlaylist]);
   }
 
   startMasterEncoder();
@@ -1074,14 +1274,14 @@ export function startFallback() {
     fileToPlay = state.fallbackQueue.shift()!;
   } else {
     if (fallbackPlaylist.length === 0) {
-      rtmpLog.debug("Fallback playlist empty — silence");
+      rtmpLog.event("debug", Event.fallbackSilence, "Playlist de fallback vacía: silencio");
       startSilence();
       return;
     }
     fileToPlay = fallbackPlaylist[currentPlaylistIndex]!;
     currentPlaylistIndex++;
     if (currentPlaylistIndex >= fallbackPlaylist.length) {
-      rtmpLog.debug("[Fallback Playlist] End of list. Reshuffling...");
+      rtmpLog.event("debug", Event.fallbackReshuffle, "Fin de lista; re-mezclando playlist");
       shuffle(fallbackPlaylist);
       currentPlaylistIndex = 0;
     }
@@ -1100,10 +1300,28 @@ export function startFallback() {
   currentDeck.pendingTrackMeta = null;
   currentDeck.buffer.clear();
   currentDeck.residueAcc.reset();
+  currentDeck.framesOut = 0;
+  currentDeck.durationSec = 0;
+
+  // Análisis BS.1770 + silencios (si LOUDNESS_NORMALIZATION / SMART_TRANSITIONS)
+  const analysisOn = analysisEnabled();
+  const plan = analysisOn ? planTrack(getCachedAnalysis(fileToPlay)) : null;
+  currentDeck.plan = plan;
+  if (analysisOn) {
+    // Pista actual (si falta) + las dos siguientes, para tenerlas listas a tiempo
+    const upcoming = [...state.fallbackQueue.slice(0, 2), fallbackPlaylist[currentPlaylistIndex], fallbackPlaylist[(currentPlaylistIndex + 1) % Math.max(1, fallbackPlaylist.length)]];
+    requestAnalysis([fileToPlay, ...upcoming], { priority: true });
+  }
 
   const basename = path.basename(fileToPlay);
   const cleanName = basename.replace(/\.[^/.]+$/, "") || "Desconocido";
-  rtmpLog.debug(`[Deck ${currentDeck.id}] Loading track (Session ${session}): ${cleanName}`);
+  const planInfo = plan ? (plan.analyzed
+    ? ` (gain ${plan.gainDb >= 0 ? "+" : ""}${plan.gainDb} dB, I=${plan.integratedLufs} LUFS, TP=${plan.truePeakDbtp} dBTP${plan.leadSkipSec > 0 ? `, salta ${plan.leadSkipSec}s de intro muda` : ""}${plan.endSec ? `, cruza en ${plan.endSec.toFixed(1)}s` : ""})`
+    : " (sin análisis aún; gain 0 dB)") : "";
+  rtmpLog.ok(Event.trackStarted, `Reproduciendo: ${cleanName}${planInfo}`, {
+    deck: currentDeck.id, file: fileToPlay,
+    ...(plan ? { analyzed: plan.analyzed, gainDb: plan.gainDb, integratedLufs: plan.integratedLufs, truePeakDbtp: plan.truePeakDbtp, leadSkipSec: plan.leadSkipSec, endSec: plan.endSec } : {}),
+  });
 
   let parsedArtist = "";
   let parsedTitle = cleanName;
@@ -1125,26 +1343,25 @@ export function startFallback() {
       artist: finalArtist,
       duration: meta.duration,
     };
+    currentDeck.durationSec = meta.duration;
 
     // Si el deck ya empezó a sonar en el master, activar metadatos de inmediato
     if (currentDeck.state === "PLAYING" && activeDeck === currentDeck.id) {
-      state.currentTrack = {
-        file: fileToPlay,
-        title: currentDeck.pendingTrackMeta.title,
-        artist: currentDeck.pendingTrackMeta.artist,
-        duration: currentDeck.pendingTrackMeta.duration,
-        startedAt: Date.now(),
-      };
-      currentDeck.pendingTrackMeta = null;
+      activateTrackMeta(currentDeck);
     }
   });
 
+  // `-fflags nobuffer` con un ARCHIVO descarta los paquetes leídos durante el sondeo:
+  // se perdían ~1.2 s del inicio de cada MP3 (~0.1 s en FLAC). Solo tiene sentido en
+  // entradas en vivo; se conserva tras DECK_FFLAGS_NOBUFFER=true por compatibilidad.
   const args = [
     "-loglevel", "warning",
-    "-fflags", "nobuffer",
+    ...(config.deckFflagsNobuffer ? ["-fflags", "nobuffer"] : []),
     "-re",
+    ...(plan && plan.leadSkipSec > 0 ? ["-ss", plan.leadSkipSec.toFixed(3)] : []),
     "-i", fileToPlay,
     "-vn",
+    ...(plan && plan.gainDb !== 0 ? ["-af", `volume=${plan.gainDb}dB`] : []),
     "-f", "s16le",
     "-ar", "48000",
     "-ac", "2",
@@ -1161,7 +1378,7 @@ export function startFallback() {
     const reader = currentDeck.process.stdout.getReader();
     pipeFallback(currentDeck, reader, session);
   } catch (err) {
-    rtmpLog.debug(`Error starting FFmpeg on Deck ${currentDeck.id}: ${(err as Error).message}`);
+    rtmpLog.fail(ErrorCode.deckDecode, `Error al iniciar ffmpeg en deck ${currentDeck.id}`, { file: currentDeck.currentTrackFile, error: (err as Error).message });
   }
 }
 
@@ -1172,7 +1389,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
   const processInstance = deck.process;
   if (processInstance) {
     processInstance.exited.then((exitCode: number) => {
-      if (deck.process === processInstance && deck.sessionId === session && !transitionStarted) {
+      if (deck.process === processInstance && deck.sessionId === session && !transitionStarted && !(config.crossfadeSampleClock && exitCode === 0)) {
         rtmpLog.debug(`[Deck ${deck.id}] Process ended (Session ${session}, exitCode: ${exitCode}).`);
         try {
           reader.cancel();
@@ -1183,10 +1400,164 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
     }).catch(() => {});
   }
 
+  let eofLeftover: AudioStreamBuffer | null = null;
+
+  /** Procesa un bloque PCM alineado del deck. `flushing`: viene del propio buffer del deck (EOF). */
+  const handleChunk = (aligned: Uint8Array, flushing: boolean): void => {
+    // Si este deck es el secundario, precarga su FIFO para el futuro crossfade
+    if (activeDeck !== deck.id) {
+      deck.state = "PRELOADING";
+      state.deckState[deck.id] = deck.state;
+      deck.buffer.push(aligned);
+      return;
+    }
+
+    // Deck activo: marcar PLAYING y sincronizar metadatos en el momento de emisión
+    if (deck.state !== "PLAYING" && !transitionStarted) {
+      deck.state = "PLAYING";
+      state.deckState[deck.id] = deck.state;
+      activateTrackMeta(deck);
+    }
+
+    const sampleClock = config.crossfadeSampleClock;
+    // Relevo sin pérdidas: si el deck llegó al primer plano con audio ya
+    // precargado (ráfaga inicial de `ffmpeg -re` ≈0.5 s), se sigue sirviendo
+    // en orden FIFO a 1x en vez de saltárselo.
+    let out = aligned;
+    if (sampleClock && !flushing && deck.buffer.length > 0) {
+      deck.buffer.push(aligned);
+      out = deck.buffer.pull(aligned.length);
+    }
+    const outFrames = out.length >> 2;
+
+    // Retener en historyBuffer para permitir crossfade real cuando entra Live RTMP/SRT
+    deck.historyBuffer.push(out);
+
+    // Si este deck es el primario (conductor del reloj de ingesta):
+    if (!state.isBroadcasting) {
+      if (transitionStarted) {
+        deck.state = "CROSSFADING";
+        state.deckState[deck.id] = deck.state;
+        const progress = sampleClock
+          ? Math.min(1.0, (crossfadeFramesDone + outFrames) / Math.max(1, crossfadeTotalFrames))
+          : Math.min(1.0, (Date.now() - crossfadeStartTime) / (config.crossfadeSeconds * 1000));
+
+        // Equal-power crossfade (cosine)
+        const volOut = Math.cos(progress * Math.PI * 0.5);
+        const volIn = Math.cos((1 - progress) * Math.PI * 0.5);
+
+        const nextDeck = deck.id === "A" ? deckB : deckA;
+        const avail = Math.min(out.length, nextDeck.buffer.length);
+        const otherChunk = nextDeck.buffer.pull(out.length);
+        nextDeck.framesOut += avail >> 2;
+        // Solo cuenta el hueco audible (el entrante tarda ~50-100 ms en arrancar, con volumen ≈0)
+        if (progress >= 0.1) state.crossfadeUnderrunBytes += out.length - avail;
+        const mixed = mixSamples(out, volOut, otherChunk, volIn);
+        crossfadeFramesDone += outFrames;
+        deck.framesOut += outFrames;
+
+        writeToMaster(mixed);
+
+        if (progress >= 1.0) {
+          transitionStarted = false;
+          state.crossfadesCompleted++;
+          state.handoverDrainedBytes += nextDeck.buffer.length;
+          const oldDeck = deck;
+          oldDeck.state = "DRAINING";
+          state.deckState[oldDeck.id] = oldDeck.state;
+
+          activeDeck = nextDeck.id; // El nuevo deck pasa a ser el primario
+          nextDeck.state = "PLAYING";
+          state.deckState[nextDeck.id] = nextDeck.state;
+
+          // Sincronizar metadatos de la nueva canción justo al completar el relevo
+          activateTrackMeta(nextDeck);
+
+          setTimeout(() => {
+            if (oldDeck.process && oldDeck.sessionId === session) {
+              try { oldDeck.process.kill(); } catch {}
+              oldDeck.process = null;
+              oldDeck.currentTrackFile = null;
+              oldDeck.buffer.clear();
+              oldDeck.state = "STOPPED";
+              state.deckState[oldDeck.id] = oldDeck.state;
+            }
+          }, 50);
+        }
+      } else if (isFallbackFadeInActive) {
+        // Fundido de entrada suave (después de desconexión de OBS)
+        const fadeSec = config.lowLatency ? config.crossfadeLiveSeconds : config.crossfadeSeconds;
+        const elapsed = Date.now() - fallbackFadeInStartTime;
+        const progress = Math.min(1.0, elapsed / (fadeSec * 1000));
+
+        const faded = applyVolume(out, progress);
+        deck.framesOut += outFrames;
+        writeToMaster(faded);
+
+        if (progress >= 1.0) {
+          isFallbackFadeInActive = false;
+        }
+      } else {
+        // Reproducción normal al 100% de volumen (o completando la rampa de
+        // entrada si el deck anterior terminó a mitad del crossfade)
+        if (tailFadeIn) {
+          const p = Math.min(1.0, (tailFadeIn.done + outFrames) / Math.max(1, tailFadeIn.total));
+          const volIn = Math.sin(p * Math.PI * 0.5);
+          const left = tailFadeIn.leftover;
+          if (left && left.length > 0) {
+            writeToMaster(mixSamples(out, volIn, left.pull(out.length), Math.cos(p * Math.PI * 0.5)));
+          } else {
+            writeToMaster(applyVolume(out, volIn));
+          }
+          tailFadeIn.done += outFrames;
+          if (p >= 1.0) tailFadeIn = null;
+        } else {
+          writeToMaster(out);
+        }
+        deck.framesOut += outFrames;
+
+        // Monitorear final de tema para disparar crossfade
+        const metaDuration = state.currentTrack?.duration ?? 0;
+        const endSec = sampleClock ? deckEndSec(deck, metaDuration) : (deck.plan?.endSec ?? metaDuration);
+        if (state.currentTrack && endSec > 0) {
+          const elapsed = sampleClock ? deck.framesOut / SAMPLE_RATE : (Date.now() - state.currentTrack.startedAt) / 1000;
+          const remaining = endSec - elapsed;
+
+          if (remaining <= config.crossfadeSeconds && !transitionStarted) {
+            transitionStarted = true;
+            crossfadeStartTime = Date.now();
+            crossfadeFramesDone = 0;
+            crossfadeTotalFrames = Math.max(1, Math.round(Math.min(config.crossfadeSeconds, Math.max(remaining, 0.05)) * SAMPLE_RATE));
+            tailFadeIn = null;
+            rtmpLog.ok(Event.crossfadeStarted, `Crossfade desde deck ${deck.id}`, { deck: deck.id, atSec: Math.round(elapsed * 100) / 100, endSec: Math.round(endSec * 100) / 100, clock: sampleClock ? "samples" : "wall" });
+
+            // Iniciar el siguiente en el deck inactivo
+            startFallback();
+          }
+        }
+      }
+    }
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        // EOF: con el relevo FIFO el deck activo aún guarda audio precargado (~0.5 s).
+        // En pleno crossfade se cede al deck entrante (ver tailFadeIn); fuera de él se
+        // emite. Antes ese audio se perdía y el crossfade se truncaba.
+        if (config.crossfadeSampleClock && deck.sessionId === session && activeDeck === deck.id && !state.isBroadcasting && deck.buffer.length > 0) {
+          if (transitionStarted) {
+            eofLeftover = new AudioStreamBuffer(0);
+            eofLeftover.push(deck.buffer.pull(deck.buffer.length));
+          } else {
+            while (deck.buffer.length > 0 && deck.sessionId === session && activeDeck === deck.id) {
+              handleChunk(deck.buffer.pull(Math.min(deck.buffer.length, 19200)), true);
+            }
+          }
+        }
+        break;
+      }
 
       // Si la sesión fue sustituida o descartada, detener consumo
       if (deck.sessionId !== session) break;
@@ -1195,120 +1566,11 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
       const aligned = deck.residueAcc.feed(value);
       if (aligned.length === 0) continue;
 
-      // Si este deck es el secundario, precarga su FIFO para el futuro crossfade
-      if (activeDeck !== deck.id) {
-        deck.state = "PRELOADING";
-        state.deckState[deck.id] = deck.state;
-        deck.buffer.push(aligned);
-        continue;
-      }
-
-      // Deck activo: marcar PLAYING y sincronizar metadatos en el momento de emisión
-      if (deck.state !== "PLAYING" && !transitionStarted) {
-        deck.state = "PLAYING";
-        state.deckState[deck.id] = deck.state;
-        if (deck.pendingTrackMeta) {
-          state.currentTrack = {
-            file: deck.pendingTrackMeta.file,
-            title: deck.pendingTrackMeta.title,
-            artist: deck.pendingTrackMeta.artist,
-            duration: deck.pendingTrackMeta.duration,
-            startedAt: Date.now(),
-          };
-          deck.pendingTrackMeta = null;
-        }
-      }
-
-      // Retener en historyBuffer para permitir crossfade real cuando entra Live RTMP/SRT
-      deck.historyBuffer.push(aligned);
-
-      // Si este deck es el primario (conductor del reloj de ingesta):
-      if (!state.isBroadcasting) {
-        if (transitionStarted) {
-          deck.state = "CROSSFADING";
-          state.deckState[deck.id] = deck.state;
-          const elapsed = Date.now() - crossfadeStartTime;
-          const progress = Math.min(1.0, elapsed / (config.crossfadeSeconds * 1000));
-          
-          // Equal-power crossfade (cosine)
-          const volOut = Math.cos(progress * Math.PI * 0.5);
-          const volIn = Math.cos((1 - progress) * Math.PI * 0.5);
-
-          const nextDeck = deck.id === "A" ? deckB : deckA;
-          const otherChunk = nextDeck.buffer.pull(aligned.length);
-          const mixed = mixSamples(aligned, volOut, otherChunk, volIn);
-
-          writeToMaster(mixed);
-
-          if (progress >= 1.0) {
-            transitionStarted = false;
-            const oldDeck = deck;
-            oldDeck.state = "DRAINING";
-            state.deckState[oldDeck.id] = oldDeck.state;
-
-            activeDeck = nextDeck.id; // El nuevo deck pasa a ser el primario
-            nextDeck.state = "PLAYING";
-            state.deckState[nextDeck.id] = nextDeck.state;
-
-            // Sincronizar metadatos de la nueva canción justo al completar el relevo
-            if (nextDeck.pendingTrackMeta) {
-              state.currentTrack = {
-                file: nextDeck.pendingTrackMeta.file,
-                title: nextDeck.pendingTrackMeta.title,
-                artist: nextDeck.pendingTrackMeta.artist,
-                duration: nextDeck.pendingTrackMeta.duration,
-                startedAt: Date.now(),
-              };
-              nextDeck.pendingTrackMeta = null;
-            }
-            
-            setTimeout(() => {
-              if (oldDeck.process && oldDeck.sessionId === session) {
-                try { oldDeck.process.kill(); } catch {}
-                oldDeck.process = null;
-                oldDeck.currentTrackFile = null;
-                oldDeck.buffer.clear();
-                oldDeck.state = "STOPPED";
-                state.deckState[oldDeck.id] = oldDeck.state;
-              }
-            }, 50);
-          }
-        } else if (isFallbackFadeInActive) {
-          // Fundido de entrada suave (después de desconexión de OBS)
-          const fadeSec = config.lowLatency ? config.crossfadeLiveSeconds : config.crossfadeSeconds;
-          const elapsed = Date.now() - fallbackFadeInStartTime;
-          const progress = Math.min(1.0, elapsed / (fadeSec * 1000));
-
-          const faded = applyVolume(aligned, progress);
-          writeToMaster(faded);
-
-          if (progress >= 1.0) {
-            isFallbackFadeInActive = false;
-          }
-        } else {
-          // Reproducción normal al 100% de volumen
-          writeToMaster(aligned);
-
-          // Monitorear final de tema para disparar crossfade
-          if (state.currentTrack && state.currentTrack.duration > 0) {
-            const elapsed = (Date.now() - state.currentTrack.startedAt) / 1000;
-            const remaining = state.currentTrack.duration - elapsed;
-
-            if (remaining <= config.crossfadeSeconds && !transitionStarted) {
-              transitionStarted = true;
-              crossfadeStartTime = Date.now();
-              rtmpLog.debug(`[Crossfade] Track ending. Crossfading from Deck ${deck.id}.`);
-              
-              // Iniciar el siguiente en el deck inactivo
-              startFallback();
-            }
-          }
-        }
-      }
+      handleChunk(aligned, false);
     }
   } catch (err) {
     if (!isStoppingFallback && deck.sessionId === session) {
-      rtmpLog.debug(`Error reading Deck stream ${deck.id}: ${(err as Error).message}`);
+      rtmpLog.fail(ErrorCode.deckDecode, `Error leyendo el stream del deck ${deck.id}`, { error: (err as Error).message });
     }
   } finally {
     if (deck.sessionId === session) {
@@ -1326,11 +1588,23 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
           startFallback();
         } else if (activeDeck === deck.id && transitionStarted) {
           // Deck terminó durante un crossfade — completar la transición
-          rtmpLog.debug(`[Deck ${deck.id}] Process ended during crossfade. Completing transition.`);
+          const leftoverFrames = (eofLeftover?.length ?? 0) >> 2;
+          const doneFrac = crossfadeTotalFrames > 0 ? Math.min(1, (crossfadeFramesDone + leftoverFrames) / crossfadeTotalFrames) : 0;
+          // ≥95 %: el saliente tenía audio para (casi) todo el fundido (p. ej. ffprobe
+          // sobreestima la duración en el relleno del MP3); por debajo, fundido truncado.
+          if (config.crossfadeSampleClock && doneFrac >= 0.95) state.crossfadesCompleted++;
+          else state.crossfadesTruncated++;
+          rtmpLog.event("info", Event.trackEnded, `Deck ${deck.id} terminó; completando transición`, { deck: deck.id, crossfadeProgress: Math.round(doneFrac * 100) / 100 });
           transitionStarted = false;
           activeDeck = deck.id === "A" ? "B" : "A";
           const newDeck = activeDeck === "A" ? deckA : deckB;
-          newDeck.buffer.clear();
+          if (config.crossfadeSampleClock) {
+            // Sin descartar el audio precargado; el entrante termina su rampa de volumen
+            state.handoverDrainedBytes += newDeck.buffer.length;
+            tailFadeIn = { done: crossfadeFramesDone, total: crossfadeTotalFrames, leftover: eofLeftover };
+          } else {
+            newDeck.buffer.clear();
+          }
           if (!newDeck.process) {
             startFallback();
           }
@@ -1342,6 +1616,7 @@ async function pipeFallback(deck: Deck, reader: ReadableStreamDefaultReader<Uint
 
 export function stopFallback() {
   isStoppingFallback = true;
+  tailFadeIn = null;
   if (deckA.process) {
     try { deckA.process.kill(); } catch {}
     deckA.process = null;
@@ -1398,7 +1673,7 @@ export async function runRtmpListener() {
     if (state.shuttingDown) break;
 
     if (Date.now() < rtmpCooldownUntil) {
-      rtmpLog.warn(`[RTMP] In cooldown due to flaps. Ignoring connections until ${new Date(rtmpCooldownUntil).toISOString()}`);
+      rtmpLog.event("warn", Event.sourceCooldown, "RTMP en cooldown por flaps; ignorando conexiones", { until: new Date(rtmpCooldownUntil).toISOString() });
       await new Promise((r) => setTimeout(r, 2000));
       continue;
     }
@@ -1460,7 +1735,7 @@ export async function runRtmpListener() {
           liveTransitionStartTime = Date.now();
           isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
           const rtmpLiveMsg = config.lowLatency ? "RTMP LIVE! (low-latency instant)" : `RTMP connection established and live (after ${config.rtmpMinLiveSeconds}s sustained audio)`;
-          rtmpLog.info(rtmpLiveMsg);
+          rtmpLog.ok(Event.sourceConnected, rtmpLiveMsg, { source: "rtmp", lowLatency: config.lowLatency });
 
           state.currentTrack = null;
         }
@@ -1495,10 +1770,10 @@ export async function runRtmpListener() {
         }
       }
     } catch (err) {
-      rtmpLog.debug("Error in RTMP FFmpeg process:", (err as Error).message);
+      rtmpLog.fail(ErrorCode.source, "Error en el proceso RTMP", { error: (err as Error).message });
     } finally {
       const wasBroadcasting = state.isBroadcasting;
-      rtmpLog.debug("RTMP source disconnected. Cleaning up...");
+      rtmpLog.ok(Event.sourceDisconnected, "Fuente RTMP desconectada; limpiando", { source: "rtmp" });
       state.isBroadcasting = false;
       state.sourceConnected = false;
       state.detectedBitrateKbps = null;
@@ -1520,7 +1795,7 @@ export async function runRtmpListener() {
       disconnectTimestamps.push(now);
       if (disconnectTimestamps.length > flapMaxCount) {
         rtmpCooldownUntil = now + flapCooldownMs;
-        rtmpLog.warn(`[RTMP] Too many rapid disconnections (${disconnectTimestamps.length} en ${flapWindowMs / 1000}s). Entering cooldown ${flapCooldownMs / 1000}s.`);
+        rtmpLog.event("warn", Event.sourceCooldown, "Demasiadas desconexiones RTMP; entrando en cooldown", { count: disconnectTimestamps.length, windowSec: flapWindowMs / 1000, cooldownSec: flapCooldownMs / 1000 });
         disconnectTimestamps = [];
       }
 
@@ -1553,14 +1828,13 @@ export async function runSrtListener() {
     if (state.shuttingDown) break;
 
     if (Date.now() < srtCooldownUntil) {
-      rtmpLog.debug(`[SRT] cooldown until ${new Date(srtCooldownUntil).toISOString()}`);
+      rtmpLog.event("debug", Event.sourceCooldown, "SRT en cooldown", { until: new Date(srtCooldownUntil).toISOString() });
       await new Promise((r) => setTimeout(r, 2000));
       continue;
     }
 
     // SRT ready is debug only (TUI shows status via side panel, not log spam)
-    rtmpLog.debug(`[SRT] listener restart (port ${config.srtPort})`);
-    rtmpLog.debug(`SRT listener srt://${config.host}:${config.srtPort}?streamid=live/${config.rtmpStreamKey}`);
+    rtmpLog.ok(Event.sourceListening, `Escuchando SRT en el puerto ${config.srtPort}`, { port: config.srtPort, host: config.host, protocol: "srt" });
 
     const args = [
       "-loglevel", "warning",
@@ -1585,12 +1859,12 @@ export async function runSrtListener() {
       const proc = state.sourceProcess;
       proc.exited.then((code: number) => {
         if (state.sourceProcess === proc) {
-          rtmpLog.debug(`[SRT] process ended (exit ${code})`);
+          rtmpLog.event("info", Event.sourceStopped, `Receptor SRT terminó (exit ${code})`, { exitCode: code });
           try { reader.cancel(); } catch {}
         }
       }).catch(()=>{});
 
-      rtmpLog.debug(`[SRT] connected, waiting for audio`);
+      rtmpLog.event("debug", Event.sourceListening, "SRT receptor activo, esperando audio");
 
       let firstAudioAt = 0;
       while (true) {
@@ -1604,7 +1878,7 @@ export async function runSrtListener() {
         state.totalBytesReceived += value.byteLength;
         if (firstAudioAt === 0) {
           firstAudioAt = Date.now();
-          rtmpLog.debug(`[SRT] first audio ${value.byteLength}B`);
+          rtmpLog.event("debug", Event.sourceListening, "SRT: primer audio recibido", { bytes: value.byteLength });
         }
         const sustained = config.lowLatency ? true : (Date.now() - firstAudioAt) >= config.rtmpMinLiveSeconds * 1000;
         if (!state.isBroadcasting && sustained) {
@@ -1613,7 +1887,7 @@ export async function runSrtListener() {
           liveTransitionStartTime = Date.now();
           isLiveTransitionActive = config.crossfadeLiveSeconds > 0;
           const liveMsg = config.lowLatency ? "🔴 LIVE — you're on air!" : `🔴 LIVE (after ${config.rtmpMinLiveSeconds}s)`;
-          rtmpLog.info(liveMsg);
+          rtmpLog.ok(Event.sourceConnected, liveMsg, { source: "srt" });
           state.currentTrack = null;
         }
 
@@ -1641,10 +1915,11 @@ export async function runSrtListener() {
         }
       }
     } catch (err) {
-      rtmpLog.debug("Error SRT:", (err as Error).message);
+      rtmpLog.fail(missingBinaryCode(err) ?? ErrorCode.source, "Error en la fuente SRT", { error: (err as Error).message });
+      await new Promise((r) => setTimeout(r, 2000));
     } finally {
       const wasBroadcasting = state.isBroadcasting;
-      rtmpLog.debug("SRT source disconnected. Cleaning up...");
+      rtmpLog.ok(Event.sourceDisconnected, "Fuente SRT desconectada; limpiando", { source: "srt" });
       state.isBroadcasting = false;
       state.sourceConnected = false;
       state.detectedBitrateKbps = null;
@@ -1659,7 +1934,7 @@ export async function runSrtListener() {
       disconnectTimestamps.push(now);
       if (disconnectTimestamps.length > flapMaxCount) {
         srtCooldownUntil = now + flapCooldownMs;
-        rtmpLog.debug(`[SRT] too many flaps (${disconnectTimestamps.length}) cooldown ${flapCooldownMs/1000}s`);
+        rtmpLog.event("warn", Event.sourceCooldown, "SRT: demasiados flaps; entrando en cooldown", { count: disconnectTimestamps.length, cooldownSec: flapCooldownMs / 1000 });
         disconnectTimestamps = [];
       }
       if (!state.shuttingDown && wasBroadcasting) {

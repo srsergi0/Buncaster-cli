@@ -14,6 +14,7 @@ export interface Config {
   preBufferBytes: number;
   corsOrigin: string;
   logLevel: LogLevel;
+  logFormat: "text" | "json";
   fallbackBitrateKbps: number;
   fallbackSource: string;
   crossfadeSeconds: number;
@@ -29,6 +30,29 @@ export interface Config {
   lowLatency: boolean;
   adminUser: string;
   adminPassword: string;
+  // --- Engine roundtable (docs/ENGINE-ROUNDTABLE.md) ---
+  /** Prebuffer medido en segundos de audio por tier (0 = usar PREBUFFER_BYTES). */
+  preBufferSeconds: number;
+  /** Reloj por muestras para crossfade + drenado del buffer del deck en el relevo. */
+  crossfadeSampleClock: boolean;
+  /** Añade `-fflags nobuffer` al ffmpeg de los decks (comportamiento antiguo: recorta ~1.2 s al inicio de cada MP3). */
+  deckFflagsNobuffer: boolean;
+  /** Segundos sin PCM (sin directo) antes de reiniciar el fallback. 0 = desactivado. */
+  fallbackStallSeconds: number;
+  /** Reinicio supervisado (con backoff) del encoder Opus si muere o se cuelga. */
+  encoderSupervision: boolean;
+  /** Normalización de sonoridad por pista (BS.1770 / EBU R128, ganancia estática). */
+  loudnessNormalization: boolean;
+  loudnessTargetLufs: number;
+  loudnessTruePeakDbtp: number;
+  loudnessMaxGainDb: number;
+  /** Transiciones por energía: salta silencio inicial y cruza donde termina la música. */
+  smartTransitions: boolean;
+  silenceThresholdDb: number;
+  /** Con análisis activo: analizar en segundo plano toda la carpeta de fallback al arrancar. */
+  analysisPrescan: boolean;
+  /** Archivo de caché del análisis de pistas (sonoridad + silencios). */
+  analysisCacheFile: string;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -47,6 +71,17 @@ export function envFloat(name: string, fallback: number): number {
   const n = Number(raw);
   if (Number.isNaN(n) || n < 0) {
     throw new Error(`Environment variable ${name} invalid: "${raw}" (expected a non-negative number)`);
+  }
+  return n;
+}
+
+/** Float con signo (p. ej. LUFS negativos). */
+export function envSignedFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Environment variable ${name} invalid: "${raw}" (expected a number)`);
   }
   return n;
 }
@@ -101,6 +136,7 @@ function loadConfig(): Config {
     preBufferBytes: envInt("PREBUFFER_BYTES", lowLatency ? 8192 : 65536),
     corsOrigin: process.env.CORS_ORIGIN || "*",
     logLevel: (process.env.LOG_LEVEL as LogLevel) || "info",
+    logFormat: process.env.LOG_FORMAT === "json" ? "json" : "text",
     fallbackBitrateKbps: envInt("STREAM_BITRATE_KBPS", 320),
     fallbackSource: process.env.FALLBACK_SOURCE !== undefined ? process.env.FALLBACK_SOURCE : "",
     crossfadeSeconds: envFloat("CROSSFADE_SECONDS", lowLatency ? 1 : 2),
@@ -123,9 +159,34 @@ function loadConfig(): Config {
     lowLatency,
     adminUser: process.env.ADMIN_USER || "admin",
     adminPassword: process.env.ADMIN_PASSWORD || "",
+    preBufferSeconds: envFloat("PREBUFFER_SECONDS", 0),
+    crossfadeSampleClock: envBool("CROSSFADE_SAMPLE_CLOCK", true),
+    deckFflagsNobuffer: envBool("DECK_FFLAGS_NOBUFFER", false),
+    fallbackStallSeconds: envFloat("FALLBACK_STALL_SECONDS", 5),
+    encoderSupervision: envBool("ENCODER_SUPERVISION", true),
+    loudnessNormalization: envBool("LOUDNESS_NORMALIZATION", false),
+    loudnessTargetLufs: envSignedFloat("LOUDNESS_TARGET_LUFS", -16),
+    loudnessTruePeakDbtp: envSignedFloat("LOUDNESS_TRUE_PEAK_DBTP", -1),
+    loudnessMaxGainDb: envFloat("LOUDNESS_MAX_GAIN_DB", 12),
+    smartTransitions: envBool("SMART_TRANSITIONS", false),
+    silenceThresholdDb: envSignedFloat("SILENCE_THRESHOLD_DB", -50),
+    analysisPrescan: envBool("ANALYSIS_PRESCAN", true),
+    analysisCacheFile: process.env.ANALYSIS_CACHE_FILE || ".analysis-cache.json",
   };
 
   return cfg;
 }
 
 export const config = loadConfig();
+
+/**
+ * Bytes de prebuffer para un tier. Con PREBUFFER_SECONDS>0 se calcula a partir
+ * del bitrate nominal del tier (segundos × kbps × 125); si no, PREBUFFER_BYTES.
+ */
+export function prebufferBytesFor(tier: "mp3" | "opus", cfg: Pick<Config, "preBufferSeconds" | "preBufferBytes" | "fallbackBitrateKbps" | "opusTierBitrateKbps"> = config): number {
+  if (cfg.preBufferSeconds > 0) {
+    const kbps = tier === "opus" ? cfg.opusTierBitrateKbps : cfg.fallbackBitrateKbps;
+    return Math.round(cfg.preBufferSeconds * kbps * 125);
+  }
+  return cfg.preBufferBytes;
+}
