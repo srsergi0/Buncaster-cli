@@ -39,3 +39,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 musica
 bunradio.exe
 .analysis-cache.json
+
+# MoQ (docs/ENGINE-MOQ.md): artefactos compilados y secretos locales
+public/moq-player.js
+public/moq-demo.html
+moq-secrets/
+*.pem
+*.jwk

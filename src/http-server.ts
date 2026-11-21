@@ -29,6 +29,7 @@ import {
 import { flushLogsSync } from "./logger";
 import { audioClockDriftSeconds } from "./audio-router";
 import { analysisQueueStats } from "./track-analysis";
+import { moqSessionInfo, moqStatus, moqState, requestProbe } from "./moq/index";
 
 import { StreamableHttpTransport, InMemorySessionAdapter } from "mcp-lite";
 import { mcpServer } from "./mcp-server";
@@ -97,6 +98,22 @@ async function getOrBuildAppJs(): Promise<string> {
   })();
 
   return appJsBuilding;
+}
+
+// Cliente MoQ (client/moq-player.ts): prebuilt en la imagen (public/moq-player.js) o
+// compilado al vuelo desde el código fuente en desarrollo.
+let moqPlayerJs: Promise<string> | null = null;
+function getMoqPlayerJs(): Promise<string> {
+  if (!moqPlayerJs) {
+    moqPlayerJs = (async () => {
+      const prebuilt = Bun.file("public/moq-player.js");
+      if (await prebuilt.exists()) return prebuilt.text();
+      const build = await Bun.build({ entrypoints: ["client/moq-player.ts"], target: "browser", minify: true });
+      if (!build.success || !build.outputs[0]) throw new Error("build de client/moq-player.ts falló");
+      return build.outputs[0].text();
+    })().catch((e) => { moqPlayerJs = null; throw e; });
+  }
+  return moqPlayerJs;
 }
 
 /** Estado del motor (sonoridad, latencia, aire muerto, supervisión) para /status y /health. */
@@ -317,6 +334,26 @@ function engineStatus() {
     }
   }
 
+  // ---- MoQ / WebTransport (docs/ENGINE-MOQ.md) ----
+  if (path === "/moq/session" && req.method === "GET") {
+    const body = config.moqEnabled ? moqSessionInfo(req) : { enabled: false, fallbackUrl: config.moqFallbackUrl, serverTimeMs: Date.now() };
+    return Response.json(body, { headers: { "Cache-Control": "no-store", ...corsHeaders() } });
+  }
+  if (path === "/moq/player.js" && req.method === "GET") {
+    try {
+      const js = await getMoqPlayerJs();
+      return new Response(js, { headers: { "Content-Type": "application/javascript", "Cache-Control": "no-cache", ...corsHeaders() } });
+    } catch (e: any) {
+      return new Response(`console.error(${JSON.stringify("moq-player.js: " + String(e?.message ?? e))});`, { status: 500, headers: { "Content-Type": "application/javascript", ...corsHeaders() } });
+    }
+  }
+  if (path === "/moq/demo" && req.method === "GET") {
+    const demo = Bun.file("public/moq-demo.html");
+    const f = (await demo.exists()) ? demo : Bun.file("client/demo.html");
+    if (!(await f.exists())) return new Response("demo no incluida", { status: 404, headers: corsHeaders() });
+    return new Response(f, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache", ...corsHeaders() } });
+  }
+
   // ---- Public Now Playing Endpoints ----
   if ((path === "/api/now-playing" || path === "/api/current-track") && req.method === "GET") {
     const nowPlaying = getNowPlayingInfo();
@@ -338,6 +375,18 @@ function engineStatus() {
   if ((path.startsWith("/api/") || path.startsWith("/admin/api/")) && path !== "/api/now-playing" && path !== "/api/current-track") {
     if (!checkAdminAuth(req)) {
       return unauthorized();
+    }
+  }
+
+  // Solo pruebas (MOQ_LATENCY_PROBE=true): inyecta un tono marcador en la entrada del motor
+  // y devuelve la hora exacta, para medir glass-to-glass en HTTP y en MoQ con el mismo clic.
+  if (path === "/admin/api/moq/probe" && req.method === "POST") {
+    if (!config.moqLatencyProbe) return Response.json({ error: "MOQ_LATENCY_PROBE=false" }, { status: 404, headers: corsHeaders() });
+    try {
+      const r = await requestProbe();
+      return Response.json({ ok: true, ...r }, { headers: corsHeaders() });
+    } catch (e: any) {
+      return Response.json({ ok: false, error: String(e?.message ?? e) }, { status: 503, headers: corsHeaders() });
     }
   }
 
@@ -513,6 +562,7 @@ function engineStatus() {
       opusTierEnabled: config.opusTierEnabled,
       fallbackActive: !state.isBroadcasting && state.currentTrack !== null,
       engine: engineStatus(),
+      ...(config.moqEnabled ? { moq: moqStatus() } : {}),
     }, { headers: corsHeaders() });
   }
   if (path === "/metrics") {
@@ -620,6 +670,32 @@ function engineStatus() {
       "# TYPE radio_srt_wakeups_total counter",
       `radio_srt_wakeups_total ${state.srtWakeups}`,
     ];
+    if (config.moqEnabled) {
+      const m = moqStatus();
+      lines.push(
+        "# HELP radio_moq_enabled 1 si el canal MoQ publica al relay",
+        "# TYPE radio_moq_enabled gauge",
+        `radio_moq_enabled ${m.enabled ? 1 : 0}`,
+        "# HELP radio_moq_relay_connected 1 si el publicador está conectado al relay",
+        "# TYPE radio_moq_relay_connected gauge",
+        `radio_moq_relay_connected ${m.publisher?.connected ? 1 : 0}`,
+        "# HELP radio_moq_relay_connects_total Conexiones establecidas con el relay",
+        "# TYPE radio_moq_relay_connects_total counter",
+        `radio_moq_relay_connects_total ${m.publisher?.connects ?? 0}`,
+        "# HELP radio_moq_frames_total Tramas Opus de 20 ms publicadas",
+        "# TYPE radio_moq_frames_total counter",
+        `radio_moq_frames_total ${m.publisher?.framesPublished ?? 0}`,
+        "# HELP radio_moq_bytes_total Bytes de media publicados al relay",
+        "# TYPE radio_moq_bytes_total counter",
+        `radio_moq_bytes_total ${m.publisher?.bytesPublished ?? 0}`,
+        "# HELP radio_moq_encode_errors_total Fallos de opus_encode",
+        "# TYPE radio_moq_encode_errors_total counter",
+        `radio_moq_encode_errors_total ${moqState.encodeErrors}`,
+        "# HELP radio_moq_cert_rotations_total Rotaciones del certificado WebTransport",
+        "# TYPE radio_moq_cert_rotations_total counter",
+        `radio_moq_cert_rotations_total ${moqState.certRotations}`,
+      );
+    }
     return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4", ...corsHeaders() } });
   }
   return Response.json({ error: "Not Found" }, { status: 404, headers: corsHeaders() });

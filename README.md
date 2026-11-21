@@ -107,6 +107,31 @@ Measured rationale for every flag: [docs/ENGINE-ROUNDTABLE.md](docs/ENGINE-ROUND
 | `MP3_ON_DEMAND` | `false` | Sin oyentes `/mp3` durante 30 s deja de codificar MP3 (LAME 320k ≈ 3,3 % de un núcleo 24/7). Guarda un historial PCM del tamaño del prebuffer mp3 y, cuando llega un oyente, lo codifica a ~30× tiempo real: recibe la misma ráfaga de prebuffer que hoy. Coste: ~1,3 s de CPU repartidos al despertar en frío (con `PREBUFFER_BYTES=1572864`) y ~7,5 MB de RAM para el historial. |
 | `SRT_ON_DEMAND` | `false` | No mantiene un `ffmpeg` SRT escuchando en reposo (≈ 1,5 % de un núcleo y 36 MB sin nadie emitiendo): un socket UDP de Bun espera el primer paquete y entonces lanza el listener. El emisor tarda ~0,3 s más en entrar en directo (un reintento de handshake). Un paquete suelto sin audio en 15 s vuelve a reposo. |
 
+### 📡 MoQ / WebTransport (medido en [docs/ENGINE-MOQ.md](docs/ENGINE-MOQ.md))
+
+Canal opcional de **baja latencia** (Media over QUIC): el motor codifica Opus en proceso (libopus FFI, tramas de 20 ms) y lo publica a un sidecar [`moq-relay`](https://github.com/moq-dev/moq) (imagen en `moq/relay/`), que lo sirve por WebTransport/UDP. Glass-to-glass medido en Chromium: **0,33–0,36 s** (HTTP `/opus` con el prebuffer de producción: **63,6 s**). El cliente (`/moq/player.js`, demo en `/moq/demo`) cae solo al stream HTTP si algo falla. Todo apagado por defecto.
+
+| Variable | Default | Efecto |
+|----------|---------|--------|
+| `MOQ_ENABLED` | `false` | Activa el canal MoQ (requiere `libopus.so.0` y el relay). Sin oyentes MoQ no codifica nada. |
+| `MOQ_RELAY_URL` | `http://moq-relay:4434` | Dónde publica el motor (WebSocket interno del relay). |
+| `MOQ_PUBLIC_URL` | `` (→ `https://<Host>:4433`) | URL WebTransport que se da al navegador. |
+| `MOQ_PATH` / `MOQ_BROADCAST` | `bloom` / `radio.hang` | Ruta (root del JWT) y nombre del broadcast hang. |
+| `MOQ_OPUS_BITRATE_KBPS` | `128` | Bitrate Opus del canal MoQ (el HTTP sigue con `OPUS_TIER_BITRATE_KBPS`). |
+| `MOQ_OPUS_FRAME_MS` | `20` | 20/40/60 ms. 60 ms ≈ −40 % de CPU en el relay, +40 ms de latencia y peor ante pérdidas (medido). |
+| `MOQ_OPUS_FEC` / `MOQ_OPUS_PACKET_LOSS_PERC` | `false` / `0` | FEC en banda: fuerza modo híbrido; PEAQ 128k de −0,43 a −2,14. No usar con música. |
+| `MOQ_GROUP_MS` | `100` | Audio por grupo MoQ (= un stream QUIC). Grupos de 1 s: menos CPU pero cortes de 0,5–1 s con pérdidas. |
+| `MOQ_MAX_AGE_MS` | `1000` | Edad máxima de un grupo no-último antes de que el relay lo salte. |
+| `MOQ_CLIENT_TARGET_MS` | `250` | Jitter buffer objetivo del cliente (en `/moq/session`). |
+| `MOQ_CERT_DIR` | `/moq-secrets` | Volumen compartido con el relay: `cert.pem`/`key.pem` (activo), `next.*` y `publish.jwk`. Claves 0600. |
+| `MOQ_CERT_DAYS` / `MOQ_CERT_ROTATE_DAYS` | `10` / `5` | Certificado ECDSA P-256 autofirmado (≤ 14 días, `serverCertificateHashes`); se rota con solape. |
+| `MOQ_CERT_NAMES` | `localhost` | SAN del certificado (DNS/IPv4, comas). |
+| `MOQ_SECRETS_UID` | `10001` | Dueño de los secretos (usuario del relay) si el motor corre como root. |
+| `MOQ_FALLBACK_URL` | `/opus` | Stream HTTP de respaldo del cliente. |
+| `MOQ_LATENCY_PROBE` | `false` | Solo pruebas: `POST /admin/api/moq/probe` inyecta un tono marcador en la entrada del motor. |
+
+Rutas: `GET /moq/session` (URL, hashes de certificado, fallback; sin secretos), `GET /moq/player.js`, `GET /moq/demo`. Métricas: `radio_moq_*`; bloque `moq` en `/status`.
+
 Métricas nuevas: `radio_deck_decodes_total{engine}`, `radio_mp3_encoder_active`, `radio_mp3_encoder_wakeups_total`, `radio_srt_armed`, `radio_srt_wakeups_total`; bloque `engine.bunWay` en `/status`.
 
 New observability: `/status` and `/health` include an `engine` block (current track loudness/gain, prebuffer seconds per tier, join backlog, dead air, crossfade results, encoder restarts). `/metrics` adds `radio_dead_air_seconds_total`, `radio_digital_silence_seconds_total`, `radio_fallback_stall_restarts_total`, `radio_opus_encoder_restarts_total`, `radio_crossfades_total{result}`, `radio_prebuffer_seconds{tier}`, `radio_listener_join_backlog_seconds_*`, `radio_audio_clock_drift_seconds`.
@@ -214,6 +239,7 @@ Included MCP tools: `get_status`, `get_queue`, `push_to_queue`, `remove_from_que
 
 Explore in-depth architectural audits and performance reports in the [`docs/`](docs/) directory:
 - [docs/ENGINE-BUN-WAY.md](docs/ENGINE-BUN-WAY.md): modelo de costes medido (CPU, memoria, copias, syscalls) y las optimizaciones con su antes/después.
+- [docs/ENGINE-MOQ.md](docs/ENGINE-MOQ.md): canal Media over QUIC / WebTransport (sidecar moq-relay, cliente WebCodecs, certificados efímeros), glass-to-glass medido y despliegue.
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): Memory profiles, Audio Ring Buffer, and benchmarks.
 - [docs/SRC2.md](docs/SRC2.md) & [docs/IMPLEMENTACION.md](docs/IMPLEMENTACION.md): Architectural audit, FFI memory bounds, and state machines.
 - [docs/RELAY-EXPLAINER.md](docs/RELAY-EXPLAINER.md): Mass-scale fan-out architecture via relays and edge CDNs.

@@ -26,6 +26,9 @@ startFallback();
 // Arrancar receptor SRT en segundo plano (sin RTMP, sin plan B)
 runSrtListener();
 
+// Canal MoQ/WebTransport (MOQ_ENABLED=false por defecto; docs/ENGINE-MOQ.md)
+if (config.moqEnabled) void import("./moq/index").then((m) => m.startMoq());
+
 // Anunciar que el servidor está listo y accesible
 logReady({
   dashboard: config.dashboardPort,
@@ -58,6 +61,7 @@ function shutdown(signal: string): void {
   stopFallback();
   stopSilence();
   stopMasterEncoder();
+  if (config.moqEnabled) void import("./moq/index").then((m) => m.stopMoq());
 
   if (state.sourceProcess) {
     sysLog.info("Stopping SRT receiver...");

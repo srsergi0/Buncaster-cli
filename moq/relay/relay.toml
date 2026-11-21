@@ -1,0 +1,46 @@
+# moq-relay para Buncaster (docs/ENGINE-MOQ.md). Cada clave también es flag/env
+# (MOQ_LISTEN, MOQ_LISTEN_TLS_CERT, ...): el entrypoint sobreescribe lo variable.
+[log]
+level = "info"
+
+[listen]
+# QUIC/WebTransport (UDP). Es lo único que se publica al host.
+bind = "[::]:4433"
+# Handshake (QUIC + WebTransport + SETUP) en ≤ 5 s o se cierra.
+timeout = "5s"
+
+[listen.tls]
+# Los escribe Buncaster (MOQ_CERT_DIR) en un volumen compartido; el relay los
+# recarga al cambiar (rotación sin reinicio).
+cert = "/certs/cert.pem"
+key = "/certs/key.pem"
+
+[quic]
+congestion_control = "delay"   # BBRv3
+# Streams que un cliente puede abrir (control + suscripciones). Un oyente usa
+# unos pocos; el tope limita cuántas suscripciones (ancho de banda) cuelga una sesión.
+max_streams = 32
+idle_timeout = "10s"
+keep_alive = "3s"
+receive_window = 1048576       # 1 MiB: nadie sube media salvo el publicador local
+# Datos sin confirmar por conexión. Medido: con 2 MiB, 200 clientes lentos llevaron el relay
+# a OOM (256 MiB). 256 KiB son ~16 s de Opus 128k: de sobra para el jitter buffer (≤ 1 s)
+# y acotan la memoria por oyente lento (200 × 256 KiB ≈ 50 MiB).
+send_window = 262144
+
+[web.http]
+# HTTP + WebSocket (qmux) en claro: por aquí publica Buncaster dentro de la red
+# docker y, en el futuro, el fallback WebSocket vía Cloudflare Tunnel. NO publicar al host.
+listen = "[::]:4434"
+
+[internal]
+listen = "127.0.0.1:9101"
+
+[auth]
+# `moq auth serve` en el mismo contenedor (loopback): lectura anónima bajo
+# bloom/**, publicación solo con JWT firmado por Buncaster, sesiones por IP.
+url = "http://127.0.0.1:4440/"
+
+[cache]
+duration = "10s"
+capacity = "64MiB"

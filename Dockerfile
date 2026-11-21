@@ -5,8 +5,11 @@ COPY package.json bun.lock tsconfig.json ./
 RUN bun install --frozen-lockfile
 COPY src ./src
 COPY public ./public
+COPY client ./client
 # Pre-compilar bundle del frontend web para servirlo de forma instantánea
 RUN bun build src/web/App.tsx --outfile=public/app.js --target=browser
+# Cliente MoQ (docs/ENGINE-MOQ.md): módulo autocontenido + página de demo, servidos en /moq/*
+RUN bun build client/moq-player.ts --target=browser --minify --outfile=public/moq-player.js && cp client/demo.html public/moq-demo.html
 # Compilar binario autónomo de Buncaster
 RUN bun build --compile --target=bun-linux-x64-modern --outfile=buncaster src/cli.ts
 

@@ -1,8 +1,16 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { state } from "../src/state";
 import { checkAudioWatchdog } from "../src/audio-router";
 
 describe("Audio Watchdog & Live Failover", () => {
+  // Estado global compartido entre archivos: se restaura tras cada test para que el
+  // orden (bun test --randomize) no deje isBroadcasting=true a otros tests.
+  let saved: Pick<typeof state, "isBroadcasting" | "sourceConnected" | "lastSourceAudioTimeMs" | "sourceProcess" | "audioUnderruns">;
+  beforeEach(() => {
+    saved = { isBroadcasting: state.isBroadcasting, sourceConnected: state.sourceConnected, lastSourceAudioTimeMs: state.lastSourceAudioTimeMs, sourceProcess: state.sourceProcess, audioUnderruns: state.audioUnderruns };
+  });
+  afterEach(() => { Object.assign(state, saved); });
+
   it("does not trigger failover when not broadcasting", () => {
     state.isBroadcasting = false;
     state.sourceConnected = false;

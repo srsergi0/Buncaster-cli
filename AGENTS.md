@@ -8,6 +8,7 @@ Radio por internet: ingesta RTMP (OBS) + transcodificación nativa (LAME-FFI + d
 |---|---|
 | 4321 | HTTP: stream (`/stream`, `/radiobloom.mp3`, `/radio.mp3`, `/stream.mp3`, `/`), panel `/admin`, API `/admin/api/*`, `/health`, `/status` |
 | 1935 | RTMP de ingesta (OBS) |
+| 4433/udp | Solo con `MOQ_ENABLED=true`: WebTransport del sidecar `moq-relay` (no lo abre el motor) |
 
 ## Variables de entorno clave
 
@@ -40,6 +41,23 @@ Radio por internet: ingesta RTMP (OBS) + transcodificación nativa (LAME-FFI + d
 | `SRT_ON_DEMAND` | `false` | Sin ffmpeg SRT en reposo; un socket UDP de Bun lo lanza al primer paquete (+0,3 s para entrar en directo). Recomendado `true` en Bloom. |
 
 Notas verificadas (nov-2026): las rutas de stream servidas son solo `/mp3` y `/opus` (el publisher usa `OPUS_UPSTREAM_URL=http://buncaster:4321/opus`); desde ENGINE-BUN-WAY los decks **sí** usan `NativeDecoder` con `USE_NATIVE_DECODE=auto` (comprobar `radio_deck_decodes_total{engine="native"}` en `/metrics`; antes, desde `e44120e`, eran siempre procesos `ffmpeg -re`); `/health` pasa a `degraded` si hay >2 s de aire muerto. No hay endpoint SSE: `src/events.ts` es solo el catálogo de nombres de evento del log.
+
+### MoQ / WebTransport (ver `docs/ENGINE-MOQ.md`) — apagado por defecto
+
+| Variable | Default | Qué hace |
+|---|---|---|
+| `MOQ_ENABLED` | `false` | Opus en proceso (libopus FFI) → sidecar `moq-relay` → WebTransport UDP. HTTP intacto. |
+| `MOQ_RELAY_URL` | `http://moq-relay:4434` | Publicación interna (WebSocket/qmux). Ese puerto NO se publica al host. |
+| `MOQ_PUBLIC_URL` | vacío | URL WebTransport para el navegador (en Bloom: `https://185.139.1.222:4433`). |
+| `MOQ_OPUS_BITRATE_KBPS` | `128` | 96 solo tras un ABX (PEAQ −0,45…−0,89). |
+| `MOQ_OPUS_FRAME_MS` / `MOQ_GROUP_MS` | `20` / `100` | Menos paquetes = menos CPU del relay, a costa de latencia/robustez (medido). |
+| `MOQ_CERT_DIR` | `/moq-secrets` | Volumen compartido con el relay (cert efímero + `publish.jwk`, 0600). Nunca en el repo. |
+| `MOQ_LATENCY_PROBE` | `false` | Solo banco de pruebas: inyecta un tono en el aire. |
+
+- Puertos nuevos: **4433/udp** (relay, público). `4434/tcp` del relay solo en la red docker.
+- Sidecar: `moq/relay/` (Dockerfile con binarios oficiales moq-relay 0.17.17 + moq-cli 0.14.17 verificados por SHA-256, `relay.toml`, entrypoint con `moq auth serve`: lectura anónima `bloom/**`, publicación solo con JWT, `MOQ_LIMIT_PER_IP` sesiones por IP).
+- Banco de pruebas: `moq/docker-compose.test.yml` + `bench/moq/` (glass-to-glass con sonda, netem, carga).
+- Volumen persistente nuevo: `moq-secrets` (compartido motor ↔ relay).
 
 ## Despliegue en producción
 ## Despliegue en producción

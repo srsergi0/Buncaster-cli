@@ -502,10 +502,29 @@ export function mp3ListenerJoined(): void {
   step();
 }
 
+// =============================================================
+// GANCHOS DE PCM (MoQ, docs/ENGINE-MOQ.md) — nulos por defecto
+// -------------------------------------------------------------
+// `transform` puede sustituir el trozo antes de que llegue a NINGÚN encoder
+// (lo usa la sonda de latencia para inyectar un tono marcador en la entrada
+// del motor). `tap` recibe el mismo PCM que los encoders, antes del lote de
+// ENCODER_BATCH_MS (el encoder Opus de MoQ trocea a 20 ms por su cuenta).
+// El trozo puede ser una vista de un búfer reutilizado: quien lo guarde, copia.
+// =============================================================
+type PcmTransform = (chunk: Uint8Array, nowMs: number) => Uint8Array;
+type PcmTap = (chunk: Uint8Array, nowMs: number) => void;
+let pcmTransform: PcmTransform | null = null;
+let pcmTap: PcmTap | null = null;
+export function setPcmHooks(hooks: { transform?: PcmTransform | null; tap?: PcmTap | null }): void {
+  if (hooks.transform !== undefined) pcmTransform = hooks.transform;
+  if (hooks.tap !== undefined) pcmTap = hooks.tap;
+}
+
 function writeToMaster(chunk: Uint8Array) {
   if (chunk.byteLength === 0) return;
 
   const nowMs = Date.now();
+  if (pcmTransform) chunk = pcmTransform(chunk, nowMs);
   if (firstPcmTimeMs === 0) firstPcmTimeMs = nowMs;
   accountAirTime(chunk, nowMs);
   state.lastPcmSampleTimeMs = nowMs;
@@ -514,6 +533,8 @@ function writeToMaster(chunk: Uint8Array) {
   const frames = Math.floor(chunk.byteLength / 4);
   state.audioClockSamples += frames;
   state.audioSamplesProduced += frames;
+
+  if (pcmTap) pcmTap(chunk, nowMs);
 
   if (!encBatch) {
     feedEncoders(chunk);

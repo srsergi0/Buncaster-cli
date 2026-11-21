@@ -17,7 +17,8 @@
     "build:server": "bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
     "build:all": "bun build --compile --outfile=bunradio src/cli.ts && bun build --compile --outfile=bunradio-server src/index-rtmp.ts",
     "mcp": "bun run src/mcp-server.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "build:moq-client": "bun build client/moq-player.ts --target=browser --minify --outfile=public/moq-player.js"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -28,6 +29,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@moq/net": "0.4.8",
     "mcp-lite": "^0.10.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

@@ -1,0 +1,52 @@
+# Banco de pruebas MoQ (docs/ENGINE-MOQ.md). NO es producción: puertos solo en
+# 127.0.0.1, sin SRT publicado, música de prueba en solo lectura.
+#   docker build -t buncaster-cli:moq . && docker build -t buncaster-moq-relay:test moq/relay
+#   TESTMUSIC=/ruta/a/musica docker compose -f moq/docker-compose.test.yml up -d
+name: buncaster-moq-test
+services:
+  engine:
+    image: ${ENGINE_IMAGE:-buncaster-cli:moq}
+    container_name: bcmoq-engine
+    environment:
+      PORT: "4321"
+      SRT_PORT: "1937"
+      NO_PROMPT: "true"
+      FALLBACK_SOURCE: ${ENGINE_FALLBACK:-/testmusic}
+      # Mismo perfil que producción (bloom/.env)
+      OPUS_TIER_BITRATE_KBPS: "192"
+      PREBUFFER_BYTES: ${PREBUFFER_BYTES:-1572864}
+      PREBUFFER_SECONDS: ${PREBUFFER_SECONDS:-0}
+      CROSSFADE_SECONDS: "2"
+      USE_NATIVE_DECODE: auto
+      MP3_ON_DEMAND: "true"
+      SRT_ON_DEMAND: "true"
+      ADMIN_PASSWORD: test
+      # Canal MoQ
+      MOQ_ENABLED: ${MOQ_ENABLED:-true}
+      MOQ_RELAY_URL: http://relay:4434
+      MOQ_PUBLIC_URL: https://relay:4433
+      MOQ_CERT_NAMES: localhost,relay
+      MOQ_LATENCY_PROBE: "true"
+      MOQ_OPUS_BITRATE_KBPS: ${MOQ_OPUS_BITRATE_KBPS:-128}
+      MOQ_GROUP_MS: ${MOQ_GROUP_MS:-100}
+      MOQ_OPUS_FRAME_MS: ${MOQ_OPUS_FRAME_MS:-20}
+      MOQ_CLIENT_TARGET_MS: ${MOQ_CLIENT_TARGET_MS:-250}
+    volumes:
+      - moq-secrets:/moq-secrets
+      - ${TESTMUSIC:?TESTMUSIC}:/testmusic:ro
+    ports:
+      - "127.0.0.1:4390:4321"
+  relay:
+    image: ${RELAY_IMAGE:-buncaster-moq-relay:test}
+    container_name: bcmoq-relay
+    restart: unless-stopped
+    environment:
+      MOQ_LIMIT_PER_IP: ${MOQ_LIMIT_PER_IP:-8}
+    volumes:
+      - moq-secrets:/certs:ro
+    ports:
+      - "127.0.0.1:4433:4433/udp"
+    cpus: 1.0
+    mem_limit: 256m
+volumes:
+  moq-secrets:

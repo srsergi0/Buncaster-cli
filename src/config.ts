@@ -63,6 +63,40 @@ export interface Config {
   mp3OnDemand: boolean;
   /** No mantiene un ffmpeg SRT escuchando: un socket UDP de Bun lo lanza al primer paquete. */
   srtOnDemand: boolean;
+  // --- MoQ / WebTransport (docs/ENGINE-MOQ.md) ---
+  /** Publica el audio (Opus por FFI, 20 ms) a un moq-relay para oyentes WebTransport. */
+  moqEnabled: boolean;
+  /** Dónde publica el motor (WebSocket/qmux, red interna), p. ej. http://moq-relay:4434. */
+  moqRelayUrl: string;
+  /** URL WebTransport que reciben los navegadores (https://IP:4433). Vacío = https://<Host de la petición>:4433. */
+  moqPublicUrl: string;
+  /** Ruta raíz en el relay (root del JWT y prefijo de lectura anónima). */
+  moqPath: string;
+  moqBroadcast: string;
+  moqOpusBitrateKbps: number;
+  /** Duración de cada paquete Opus de MoQ (20, 40 o 60 ms): menos paquetes por oyente a cambio de latencia. */
+  moqOpusFrameMs: number;
+  /** FEC en banda de Opus (LBRR). Medido: fuerza modo híbrido y empeora la música. */
+  moqOpusFec: boolean;
+  moqOpusPacketLossPerc: number;
+  /** Audio mínimo por grupo MoQ (ms). Un grupo = un stream QUIC. */
+  moqGroupMs: number;
+  /** Edad máxima de un grupo no-último antes de que el relay lo salte (ms). */
+  moqMaxAgeMs: number;
+  /** Retraso objetivo del jitter buffer del cliente (ms), servido en /moq/session. */
+  moqClientTargetMs: number;
+  /** Directorio de secretos compartido con el relay (cert/clave efímeros y clave JWT). Fuera del repo. */
+  moqCertDir: string;
+  moqCertDays: number;
+  moqCertRotateDays: number;
+  /** Nombres del SAN (DNS o IPv4), separados por comas. */
+  moqCertNames: string[];
+  /** uid del relay: dueño de cert/clave/JWK (0600) si el motor corre como root. -1 = no tocar. */
+  moqSecretsUid: number;
+  /** URL del stream HTTP de respaldo que se anuncia al cliente. */
+  moqFallbackUrl: string;
+  /** Solo pruebas: POST /admin/api/moq/probe inyecta un tono marcador en la entrada del motor. */
+  moqLatencyProbe: boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -185,6 +219,25 @@ function loadConfig(): Config {
     encoderBatchMs: Math.min(500, envInt("ENCODER_BATCH_MS", 100)),
     mp3OnDemand: envBool("MP3_ON_DEMAND", false),
     srtOnDemand: envBool("SRT_ON_DEMAND", false),
+    moqEnabled: envBool("MOQ_ENABLED", false),
+    moqRelayUrl: process.env.MOQ_RELAY_URL || "http://moq-relay:4434",
+    moqPublicUrl: process.env.MOQ_PUBLIC_URL || "",
+    moqPath: (process.env.MOQ_PATH || "bloom").replace(/^\/+|\/+$/g, ""),
+    moqBroadcast: process.env.MOQ_BROADCAST || "radio.hang",
+    moqOpusBitrateKbps: Math.max(16, Math.min(256, envInt("MOQ_OPUS_BITRATE_KBPS", 128))),
+    moqOpusFrameMs: envInt("MOQ_OPUS_FRAME_MS", 20),
+    moqOpusFec: envBool("MOQ_OPUS_FEC", false),
+    moqOpusPacketLossPerc: Math.min(100, envInt("MOQ_OPUS_PACKET_LOSS_PERC", 0)),
+    moqGroupMs: Math.min(2000, envInt("MOQ_GROUP_MS", 100)),
+    moqMaxAgeMs: Math.max(100, envInt("MOQ_MAX_AGE_MS", 1000)),
+    moqClientTargetMs: Math.max(40, Math.min(5000, envInt("MOQ_CLIENT_TARGET_MS", 250))),
+    moqCertDir: process.env.MOQ_CERT_DIR || "/moq-secrets",
+    moqCertDays: Math.max(1, Math.min(13, envFloat("MOQ_CERT_DAYS", 10))),
+    moqCertRotateDays: envFloat("MOQ_CERT_ROTATE_DAYS", 5),
+    moqCertNames: (process.env.MOQ_CERT_NAMES || "localhost").split(",").map((x) => x.trim()).filter(Boolean),
+    moqSecretsUid: process.env.MOQ_SECRETS_UID === "-1" ? -1 : envInt("MOQ_SECRETS_UID", 10001),
+    moqFallbackUrl: process.env.MOQ_FALLBACK_URL || "/opus",
+    moqLatencyProbe: envBool("MOQ_LATENCY_PROBE", false),
   };
 
   return cfg;

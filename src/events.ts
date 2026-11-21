@@ -47,6 +47,14 @@ export const Event = {
   nativeDecodeLoaded: "native.decode.loaded",
   nativeFallback: "native.fallback",
 
+  // MoQ / WebTransport (docs/ENGINE-MOQ.md)
+  moqStarted: "moq.started",
+  moqDisabled: "moq.disabled",
+  moqPublisher: "moq.publisher",
+  moqEncode: "moq.encode",
+  moqCertRotated: "moq.cert.rotated",
+  moqCertError: "moq.cert.error",
+
   error: "error",
 } as const;
 

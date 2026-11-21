@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloom MoQ demo</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e8e8ea; --mut:#9aa0a6; --acc:#7cc4ff; --ok:#5fd38d; --warn:#f3c969; --card:#181b22; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --fg:#14161a; --mut:#5b6168; --acc:#0b64c0; --ok:#1d8a4a; --warn:#9a6b00; --card:#fff; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--mut); margin:0 0 20px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  button { font:inherit; padding:10px 16px; border-radius:8px; border:1px solid var(--mut); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
+  .mode { display:inline-block; padding:2px 10px; border-radius:999px; background:var(--card); border:1px solid var(--mut); font-weight:600; }
+  .mode.moq { border-color:var(--ok); color:var(--ok); } .mode.http { border-color:var(--warn); color:var(--warn); }
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:8px; overflow:hidden; }
+  td { padding:6px 10px; border-bottom:1px solid rgba(127,127,127,.15); font-variant-numeric:tabular-nums; }
+  td:first-child { color:var(--mut); width:45%; }
+  .big { font-size:28px; font-weight:700; }
+  code { font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bloom · Media over QUIC</h1>
+  <p class="sub">WebTransport + WebCodecs + AudioWorklet. Si algo falla, cae al stream HTTP de siempre.</p>
+  <div class="row">
+    <button class="primary" id="play">Escuchar (MoQ)</button>
+    <button id="http">Escuchar (HTTP)</button>
+    <button id="stop">Parar</button>
+  </div>
+  <p>Modo: <span class="mode" id="mode">idle</span> <span id="reason" style="color:var(--mut)"></span></p>
+  <p>Retraso estimado: <span class="big" id="lat">—</span></p>
+  <table id="t"></table>
+  <p class="sub" style="margin-top:16px">Sesión: <code id="sess"></code></p>
+</main>
+<script type="module">
+  import { MoqPlayer } from "/moq/player.js";
+  const q = new URLSearchParams(location.search);
+  const sessionUrl = q.get("session") || "/moq/session";
+  document.getElementById("sess").textContent = sessionUrl;
+  let player = null;
+  const rows = [["transport","Transporte"],["protocol","Protocolo"],["targetMs","Objetivo (ms)"],["bufferedMs","Buffer (ms)"],["outputLatencyMs","Salida (ms)"],["underruns","Vaciados"],["rebufferMs","Rebuffer (ms)"],["concealedMs","Huecos rellenos (ms)"],["skippedMs","Saltado (ms)"],["framesReceived","Tramas recibidas"],["framesDecoded","Tramas decodificadas"],["rate","Ritmo"],["connectMs","Conexión (ms)"],["firstAudioMs","Primer audio (ms)"]];
+  function render(s) {
+    document.getElementById("mode").textContent = s.mode;
+    document.getElementById("mode").className = "mode " + s.mode;
+    document.getElementById("reason").textContent = s.reason ? "· " + s.reason : "";
+    document.getElementById("lat").textContent = s.latencyMs == null ? "—" : s.latencyMs + " ms";
+    document.getElementById("t").innerHTML = rows.map(([k, l]) => `<tr><td>${l}</td><td>${s[k] ?? "—"}</td></tr>`).join("");
+  }
+  function start(forceHttp) {
+    player?.stop();
+    player = new MoqPlayer({ sessionUrl, forceHttp, probe: q.get("probe") === "1", allowSafari: q.get("safari") === "1", targetLatencyMs: q.get("target") ? Number(q.get("target")) : undefined });
+    player.onstats = render;
+    window.player = player;
+    return player.play();
+  }
+  document.getElementById("play").onclick = () => start(false);
+  document.getElementById("http").onclick = () => start(true);
+  document.getElementById("stop").onclick = () => player?.stop();
+  window.startPlayer = start;
+</script>
+</body>
+</html>
